@@ -6,14 +6,14 @@ use std::sync::OnceLock;
 pub const WARMUP: usize = 10;
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn QueryPerformanceFrequency(out: *mut i64) -> i32;
     fn QueryPerformanceCounter(out: *mut i64) -> i32;
     fn Sleep(ms: u32);
 }
 
 #[link(name = "user32")]
-extern "system" {
+unsafe extern "system" {
     fn GetAsyncKeyState(key: i32) -> i16;
 }
 
@@ -34,11 +34,7 @@ fn qpc_freq_hz() -> i64 {
         unsafe { QueryPerformanceFrequency(&mut freq) };
         // If QPC is unavailable, fall back to the documented 10 MHz tick so we
         // still produce numbers instead of dividing by zero.
-        if freq > 0 {
-            freq
-        } else {
-            10_000_000
-        }
+        if freq > 0 { freq } else { 10_000_000 }
     })
 }
 

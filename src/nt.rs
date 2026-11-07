@@ -45,13 +45,13 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 #[link(name = "ntdll")]
-extern "system" {
+unsafe extern "system" {
     fn NtSetTimerResolution(desired: u32, set: u8, actual: *mut u32) -> i32;
     fn NtQueryTimerResolution(maximum: *mut u32, minimum: *mut u32, current: *mut u32) -> i32;
 }
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetCurrentProcess() -> Handle;
     fn GetCurrentThread() -> Handle;
     fn SetThreadPriority(thread: Handle, priority: i32) -> i32;
@@ -63,7 +63,7 @@ extern "system" {
 }
 
 #[link(name = "advapi32")]
-extern "system" {
+unsafe extern "system" {
     fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
     fn GetTokenInformation(
         token: Handle,

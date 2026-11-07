@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::measure;
 use crate::nt::{self, Range};
-use crate::stats::{self, ms, Plateau, Prefer, Stats};
+use crate::stats::{self, Plateau, Prefer, Stats, ms};
 
 pub struct Options {
     pub samples: usize,

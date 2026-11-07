@@ -294,8 +294,10 @@ mod tests {
     #[test]
     fn task_does_not_get_a_default_time_limit() {
         // The holder blocks forever; the default 72 h limit would kill it.
-        assert!(task_xml("C:\\timres.exe", 5000)
-            .contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(
+            task_xml("C:\\timres.exe", 5000)
+                .contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>")
+        );
         assert!(task_xml("C:\\timres.exe", 5000).contains("<DisallowStartIfOnBatteries>false"));
     }
 

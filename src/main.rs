@@ -71,7 +71,7 @@ notes:
     }
 
     #[link(name = "kernel32")]
-    extern "system" {
+    unsafe extern "system" {
         fn FreeConsole() -> i32;
     }
 
@@ -239,7 +239,7 @@ notes:
                         _ => {
                             return Err(Fail::Usage(format!(
                                 "--prefer must be latency or power: {v}"
-                            )))
+                            )));
                         }
                     };
                 }
@@ -280,18 +280,18 @@ notes:
             None if report.partial => {
                 return Err(Fail::Op(
                     "stopped with ESC before any candidate was usable".into(),
-                ))
+                ));
             }
             None if report.points.is_empty() => {
                 return Err(Fail::Op(
                     "the platform reports no usable range (finest is above 1 ms)".into(),
-                ))
+                ));
             }
             None => {
                 return Err(Fail::Op(
                     "no measured point met the usability thresholds (interference or latency)"
                         .into(),
-                ))
+                ));
             }
         };
 
@@ -434,7 +434,7 @@ notes:
             _ => {
                 return Err(Fail::Usage(
                     "exactly one of --resolution or --ms is required".into(),
-                ))
+                ));
             }
         };
 
@@ -522,7 +522,9 @@ notes:
             s.p95_ms,
             s.interference * 100.0,
         );
-        outln!("note: this process made no request; the value above is the ambient tick shared by every process");
+        outln!(
+            "note: this process made no request; the value above is the ambient tick shared by every process"
+        );
         print_query_block(&range);
         Ok(())
     }
@@ -590,7 +592,8 @@ notes:
             Verdict::PerProcess => {
                 outln!(
                     "global: NO - requests are per-process on this machine (child p50={:.3}, baseline={:.3})",
-                    child, baseline,
+                    child,
+                    baseline,
                 );
                 outln!("enabling requires GlobalTimerResolutionRequests=1 and a reboot.");
             }
@@ -617,7 +620,9 @@ notes:
             u8::from(on)
         );
         if on {
-            outln!("The flag is read at boot, so `apply --persist` is only safe after the reboot and a passing `timres verify-global`.");
+            outln!(
+                "The flag is read at boot, so `apply --persist` is only safe after the reboot and a passing `timres verify-global`."
+            );
         }
         Ok(())
     }

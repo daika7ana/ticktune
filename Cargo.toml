@@ -1,8 +1,8 @@
 [package]
 name = "timres"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 description = "Measure the Windows timer resolution that actually fits the machine, then apply it"
 license = "MIT"
 repository = "https://github.com/daika7ana/win-timer-resolution"
@@ -12,7 +12,7 @@ name = "timres"
 path = "src/main.rs"
 
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"

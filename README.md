@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)](https://github.com/daika7ana/win-timer-resolution)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](Cargo.toml)
-[![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
 [![CI](https://github.com/daika7ana/win-timer-resolution/actions/workflows/ci.yml/badge.svg)](https://github.com/daika7ana/win-timer-resolution/actions/workflows/ci.yml)
 
 Measure the timer resolution Windows actually delivers, then request the best one.
@@ -37,8 +37,10 @@ Single static executable. No dependencies, no driver, no service.
 timres query
 ```
 
-This prints the nominal range, the current global tick, the request mode and the
-dynamic-tick state. It changes nothing and needs no admin rights.
+This prints the finest and coarsest periods, the current global tick, the request
+mode, the dynamic-tick state, the installed logon task and whether you are
+elevated. It changes nothing; without elevation the dynamic-tick line reads
+`unknown`, because reading it uses `bcdedit`.
 
 ### 2. Decide what you want to affect
 
@@ -46,9 +48,11 @@ dynamic-tick state. It changes nothing and needs no admin rights.
   and disappears when that process exits. It is **not inherited**: `timres apply`
   therefore only affects `timres.exe` itself — not a child process, and not an
   already-running game or browser.
-- **Machine-wide.** After `timres global on` (elevated) and a reboot, every process
-  benefits, and a holder kept running in the background is useful. Confirm it with
-  `timres verify-global` before relying on it.
+- **Machine-wide.** After `timres global on` (elevated) and a reboot, a request
+  affects every process — but only while some process holds one. `global on` alone
+  changes nothing, so keep a holder running: the logon task from step 6, or a
+  foreground `timres apply`. Confirm it with `timres verify-global` before relying
+  on it.
 
 ```sh
 # elevated terminal
@@ -71,7 +75,8 @@ period without input — see the **Before you benchmark** note below.
 timres bench
 ```
 
-The scan takes two to three minutes and prints a short report:
+The scan takes two to three minutes and prints a report like this example (the
+plateau boundaries and point counts vary by machine):
 
 ```
 timres bench
@@ -80,9 +85,9 @@ timres bench
   global tick 1.0000 ms
 
 curve  (median p50 per plateau)
-  0.5000 - 0.5105 ms   p50 1.505 ms    32 points
+  0.5000 - 0.5105 ms   p50 1.505 ms   106 points
   0.5106 - 0.5132 ms   p50 1.019 ms    27 points  <- recommended
-  0.5133 - 1.0000 ms   p50 1.518 ms   487 points
+  0.5133 - 1.0000 ms   p50 1.518 ms   413 points
 
 result
   recommend   0.5119 ms  (5119 x 100ns)
@@ -102,12 +107,15 @@ pass; `unstable` means the machine was noisy — rerun when it is quieter.
 `--samples 100` gives a quicker, noisier answer; the default 200 is two to three
 minutes, and the cap of 1000 is about thirteen. Press `ESC` to stop early — the
 recommendation then covers the points measured so far. Use `--prefer power` if you
-would rather have the coarsest period inside the latency budget; it notes when the
-pick sits on the edge of the budget.
+would rather have the coarsest period inside the latency budget (p50 ≤ 1.35 ms and
+p95 ≤ 2.0 ms); it notes when the pick sits on the edge of the budget, and falls
+back to the latency pick if nothing qualifies. No point is ever recommended unless
+interference ≤ 2 %, p50 ≥ 0.99 ms and p95 ≤ 2.5 ms.
 
-`interference` counts samples that overshoot the median by more than 1 ms. The scan
-runs at time-critical priority, so a normal application may see somewhat more
-interference than this column reports.
+`interference` is the share of samples that overshoot the median by more than 1 ms.
+The plateau view omits it; `--rows` prints it as a percentage. The scan runs at
+time-critical priority, so a normal application may see somewhat more interference
+than this figure.
 
 ### 5. Try the value
 
@@ -115,15 +123,16 @@ interference than this column reports.
 timres apply --resolution 5120
 ```
 
-Keep the window open. In another terminal, `timres measure --samples 1000` shows what
-the system delivers while the request is held. Press ESC or Ctrl+C (or close the
+Keep the window open. The request belongs to this process alone, so `timres measure`
+in another terminal does not see it; to observe the effect system-wide, enable
+global mode (§2) and use `timres verify-global`. Press ESC or Ctrl+C (or close the
 window) to release it — no cleanup, no leftover state. With `--no-console` there is
 no Ctrl+C, so use ESC.
 
 ### 6. Keep it across reboots (optional, machine-wide only)
 
 ```sh
-timres apply --resolution 5120 --persist --no-console
+timres apply --resolution 5120 --persist
 ```
 
 This registers a Task Scheduler task named `timres` that runs the holder 15 s
@@ -135,9 +144,11 @@ would otherwise end the holder from any window; stop it from Task Scheduler
 instead. Open Task Scheduler to inspect or edit it, or delete it with
 `timres startup remove`.
 It is refused unless `GlobalTimerResolutionRequests` is `1`, because in per-process
-mode the holder would only accelerate itself. Check it after the next logon with
-`timres status`. The task stores the exe path, so rebuild or move the binary and
-you must run `--persist` again — `query` marks the old one as `stale`.
+mode the holder would only accelerate itself. That check reads the registry value,
+not the running boot: reboot and run `timres verify-global` (step 2) before
+`--persist`. Check the task after the next logon with `timres status`. The task
+stores the exe path, so rebuild or move the binary and you must run `--persist`
+again — `query` marks the old one as `stale`.
 
 ### 7. Undo everything
 
@@ -152,19 +163,27 @@ Close any holder that is still running. No other state is left behind.
 
 | Command | What it does |
 |---|---|
-| `timres query` | Print the nominal range, global tick, mode and dynamic-tick state |
+| `timres query` | Print the finest/coarsest periods, global tick, mode, dynamic-tick state and logon task |
 | `timres bench [--samples N] [--prefer latency\|power] [--rows]` | Scan and recommend |
-| `timres apply --resolution <100ns>` | Hold a period for this process |
+| `timres apply --resolution <100ns>` | Hold a period for this process; add `--persist` for the logon holder |
 | `timres apply --ms <float>` | Same, in milliseconds |
-| `timres status` | What this process really gets, next to what Windows reports |
-| `timres measure [--samples N]` | Sample only; sets nothing (cross-process probe) |
-| `timres verify-global` | Check whether global mode actually took effect |
+| `timres status` | Sample this process, then print the `query` block |
+| `timres measure [--samples N]` | Sample only; sets nothing (default 1000, max 100000) |
+| `timres verify-global` | Check whether a request affects other processes |
 | `timres global on\|off` | Write the registry key (elevated, reboot required) |
 | `timres startup remove` | Delete the logon holder |
+| `timres help` | Print the built-in help (`-h`/`--help` works after any command) |
 
 Values are in 100 ns units; the output always shows milliseconds too.
 
+Exit codes: `0` success, `1` runtime failure (a failed Windows call, no usable
+range or measurement, or a second `bench` already running), `2` bad command line or
+argument.
+
 ## 🤔 Why this is not "just set 0.5 ms"
+
+`timres` targets Windows 10 2004 (build 19041) and later, including Windows 11:
+earlier builds do not have the per-process request model this tool assumes.
 
 Since Windows 10 2004 a timer-resolution request is **per-process**: it applies to
 the process that made it and dies with it, unless
@@ -196,7 +215,8 @@ Set `DisableUserPresenceQos` (REG_DWORD `1`) under
 
 - **No `bcdedit`.** `disabledynamictick` is documented as a debugging switch and is
   widely reported to make machines unusable (minutes per UI action), and it needs a
-  reboot to undo. `status` reports it, with the revert command; nothing writes it.
+  reboot to undo. `query`/`status` report it when run elevated, with the revert
+  command if it is disabled; nothing writes it.
 - **No automatic registry writes.** `GlobalTimerResolutionRequests` is reported by
   `query`/`status` and only changed by an explicit `timres global on|off` (which
   refuses to run unelevated).
@@ -212,10 +232,15 @@ cargo build --release
 # target\release\timres.exe
 ```
 
-From Linux, cross-compile; no MSVC, no runtime DLLs:
+Put that directory on `PATH`, or replace `timres` in the examples with
+`.\target\release\timres.exe`.
+
+From Linux, install the mingw-w64 linker, then cross-compile; no MSVC, no runtime
+DLLs:
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
+sudo apt install gcc-mingw-w64-x86-64   # Debian/Ubuntu; the CI build uses this package
 cargo build --release --target x86_64-pc-windows-gnu
 # target/x86_64-pc-windows-gnu/release/timres.exe
 ```
