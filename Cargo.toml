@@ -1,6 +1,6 @@
 [package]
 name = "ticktune"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Measure the Windows timer resolution that actually fits the machine, then apply it"
