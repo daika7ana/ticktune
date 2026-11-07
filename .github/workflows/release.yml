@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Windows cross toolchain
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-mingw-w64-x86-64
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-gnu/release/timres.exe dist/
+          cd dist && sha256sum timres.exe > timres.exe.sha256
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/timres.exe dist/timres.exe.sha256 --clobber
