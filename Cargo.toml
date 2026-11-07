@@ -1,0 +1,19 @@
+[package]
+name = "timres"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Measure the Windows timer resolution that actually fits the machine, then apply it"
+
+[[bin]]
+name = "timres"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
