@@ -21,7 +21,7 @@ mod cli {
 
     const USAGE: &str =
         "usage: timres query | bench [--samples N] [--prefer latency|power] [--rows] | \
-apply (--resolution <100ns> | --ms <f64>) [--persist] [--no-console] | status | \
+apply (--resolution <100ns> | --ms <f64>) [--persist] [--no-console] [--no-esc] | status | \
 measure [--samples N] | verify-global | global on|off | startup remove";
 
     /// Samples per point in a bench run. 547 points at 1000 samples is ~11
@@ -372,6 +372,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         let mut ms_arg: Option<f64> = None;
         let mut persist = false;
         let mut no_console = false;
+        let mut esc = true;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -391,6 +392,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
                 }
                 "--persist" => persist = true,
                 "--no-console" => no_console = true,
+                "--no-esc" => esc = false,
                 a => return Err(Fail::Usage(format!("unknown apply argument: {a}"))),
             }
             i += 1;
@@ -449,22 +451,32 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             }
             return Ok(());
         }
-        outln!("holding request; press ESC or Ctrl+C to release.");
+        if esc {
+            outln!("holding request; press ESC or Ctrl+C to release.");
+        } else {
+            outln!("holding request; close this process to release.");
+        }
         // With a console, Ctrl+C terminates the process and the kernel drops the
         // request with it. --no-console keeps the holder windowless, which also
-        // removes Ctrl+C, so ESC is polled either way.
+        // removes Ctrl+C, so ESC is polled. --no-esc is for the logon holder:
+        // GetAsyncKeyState is desktop-global, so any ESC would end it.
         if no_console {
             unsafe {
                 FreeConsole();
             }
         }
-        let _ = measure::escape_pressed(); // drop a press from before we started
-        loop {
-            if measure::escape_pressed() {
-                outln!("released (ESC)");
-                return Ok(());
+        if esc {
+            let _ = measure::escape_pressed(); // drop a press from before we started
+            loop {
+                if measure::escape_pressed() {
+                    outln!("released (ESC)");
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
         }
     }
 

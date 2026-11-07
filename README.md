@@ -130,7 +130,9 @@ This registers a Task Scheduler task named `timres` that runs the holder 15 s
 after logon, starts it immediately, and returns — the task, not your shell, owns
 the request from then on. The task runs with least privilege, is allowed on
 battery, and has no execution time limit (a default task would stop it after 72
-hours). Open Task Scheduler to inspect or edit it, or delete it with
+hours). It is started with `--no-esc`, because ESC is read desktop-wide and
+would otherwise end the holder from any window; stop it from Task Scheduler
+instead. Open Task Scheduler to inspect or edit it, or delete it with
 `timres startup remove`.
 It is refused unless `GlobalTimerResolutionRequests` is `1`, because in per-process
 mode the holder would only accelerate itself. Check it after the next logon with

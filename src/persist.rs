@@ -82,7 +82,7 @@ fn task_xml(exe: &str, period_100ns: u32) -> String {
   <Actions Context=\"Author\">\r\n\
     <Exec>\r\n\
       <Command>{}</Command>\r\n\
-      <Arguments>apply --resolution {} --no-console</Arguments>\r\n\
+      <Arguments>apply --resolution {} --no-console --no-esc</Arguments>\r\n\
     </Exec>\r\n\
   </Actions>\r\n\
 </Task>\r\n",
