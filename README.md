@@ -42,8 +42,9 @@ dynamic-tick state. It changes nothing and needs no admin rights.
 ### 2. Decide what you want to affect
 
 - **Per-process (default).** A timer request belongs to the process that makes it
-  and disappears when that process exits. `timres apply` therefore only helps
-  `timres.exe` and anything it launches — not an already-running game or browser.
+  and disappears when that process exits. It is **not inherited**: `timres apply`
+  therefore only affects `timres.exe` itself — not a child process, and not an
+  already-running game or browser.
 - **Machine-wide.** After `timres global on` (elevated) and a reboot, every process
   benefits, and a holder kept running in the background is useful. Confirm it with
   `timres verify-global` before relying on it.
@@ -97,10 +98,15 @@ the same, the tool reports that band and recommends its middle: the edges of a
 plateau are marginal by definition, so repeated runs agree on the middle and only
 the edge rows wobble. `stable` means a re-check of the winner agreed with the first
 pass; `unstable` means the machine was noisy — rerun when it is quieter.
-`--samples 100` gives a quicker, noisier answer; values above 1000 are capped.
-Press `ESC` to stop early — the recommendation then covers the points measured so
-far. Use `--prefer power` if you would rather have the coarsest period inside the
-latency budget.
+`--samples 100` gives a quicker, noisier answer; the default 200 is two to three
+minutes, and the cap of 1000 is about thirteen. Press `ESC` to stop early — the
+recommendation then covers the points measured so far. Use `--prefer power` if you
+would rather have the coarsest period inside the latency budget; it notes when the
+pick sits on the edge of the budget.
+
+`interference` counts samples that overshoot the median by more than 1 ms. The scan
+runs at time-critical priority, so a normal application may see somewhat more
+interference than this column reports.
 
 ### 5. Try the value
 
@@ -122,7 +128,8 @@ This writes a small `.vbs` to the Startup folder that starts the holder at logon
 with no console window.
 It is refused unless `GlobalTimerResolutionRequests` is `1`, because in per-process
 mode the holder would only accelerate itself. Check it after the next logon with
-`timres status`.
+`timres status`. The launcher stores the exe path, so rebuild or move the binary and
+you must run `--persist` again — `query` marks the old one as `stale`.
 
 ### 7. Undo everything
 

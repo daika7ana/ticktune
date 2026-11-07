@@ -68,11 +68,6 @@ impl Stats {
         }
     }
 
-    /// Lower is better. Rewards closeness to 1.0 ms, penalises tail spread.
-    pub fn score(&self) -> f64 {
-        0.5 * self.p50_ms + 0.5 * self.p95_ms
-    }
-
     /// Safe to recommend at all: low interference, no early wake-ups.
     ///
     /// The coarse pass only takes 200 samples, so 1 % would mean two hiccups
@@ -87,83 +82,55 @@ impl Stats {
     }
 }
 
-/// Index into `stats` of the recommended point, if any.
-pub fn choose(stats: &[Stats], prefer: Prefer) -> Option<usize> {
-    let latency = || {
-        stats
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.usable())
-            .fold(None, |best: Option<(usize, &Stats)>, (i, s)| match best {
-                None => Some((i, s)),
-                Some((_, b)) => {
-                    let better = s.score() < b.score()
-                        || (s.score() == b.score() && s.period_100ns < b.period_100ns);
-                    if better {
-                        Some((i, s))
-                    } else {
-                        best
-                    }
-                }
-            })
-            .map(|(i, _)| i)
-    };
-
-    match prefer {
-        Prefer::Latency => latency(),
-        Prefer::Power => stats
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.within_budget())
-            .fold(None, |best: Option<(usize, &Stats)>, (i, s)| match best {
-                None => Some((i, s)),
-                Some((_, b)) => {
-                    let better = s.period_100ns > b.period_100ns
-                        || (s.period_100ns == b.period_100ns && s.score() < b.score());
-                    if better {
-                        Some((i, s))
-                    } else {
-                        best
-                    }
-                }
-            })
-            .map(|(i, _)| i)
-            .or_else(latency),
-    }
+/// Index of the coarsest point that still lands inside the latency budget.
+///
+/// `Prefer::Power` asks for the cheapest setting that keeps the latency; the
+/// winner can sit on the edge of the plateau, which `scan` warns about.
+pub fn coarsest_within_budget(points: &[Stats]) -> Option<usize> {
+    points
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.within_budget())
+        .max_by_key(|(_, s)| s.period_100ns)
+        .map(|(i, _)| i)
 }
 
 /// How close to the best median a point must be to count as the same setting.
 /// The quantisation plateaus are ~0.5 ms apart, so this separates them easily.
 pub const BAND_MARGIN_MS: f64 = 0.05;
 
-/// Index of the recommended point and the period band it belongs to.
+/// Index of the recommended point and the plateau it belongs to.
 ///
 /// Inside the fast band every period measures the same, so the argmin is noise.
 /// Recommend the middle of the band instead: the edges are marginal by
-/// definition, and the middle reproduces across runs.
-pub fn choose_band(points: &[Stats]) -> Option<(usize, (u32, u32))> {
-    let best = points
-        .iter()
-        .filter(|s| s.usable())
-        .min_by(|a, b| a.p50_ms.total_cmp(&b.p50_ms))?;
-    let limit = best.p50_ms + BAND_MARGIN_MS;
-    let members: Vec<(usize, &Stats)> = points
+/// definition, and the middle reproduces across runs. The band is the
+/// contiguous plateau containing the best point, so it never claims a gap is
+/// equivalent.
+pub fn choose_band(points: &[Stats]) -> Option<(usize, Plateau)> {
+    let best_index = points
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.usable() && s.p50_ms <= limit)
-        .collect();
-    let lo = members.iter().map(|(_, s)| s.period_100ns).min()?;
-    let hi = members.iter().map(|(_, s)| s.period_100ns).max()?;
-    let mid = lo + (hi - lo) / 2;
-    let (index, _) = *members
+        .filter(|(_, s)| s.usable())
+        .min_by(|a, b| a.1.p50_ms.total_cmp(&b.1.p50_ms))?
+        .0;
+    let group = plateaus(points)
+        .into_iter()
+        .find(|p| best_index >= p.start && best_index < p.start + p.points)?;
+    let mid = group.lo_100ns + (group.hi_100ns - group.lo_100ns) / 2;
+    let (index, _) = points[group.start..group.start + group.points]
         .iter()
+        .enumerate()
+        .filter(|(_, s)| s.usable())
+        .map(|(k, s)| (group.start + k, s))
         .min_by_key(|(_, s)| s.period_100ns.abs_diff(mid))?;
-    Some((index, (lo, hi)))
+    Some((index, group))
 }
 
 /// A run of consecutive measured points that behave the same.
 #[derive(Clone, Copy, Debug)]
 pub struct Plateau {
+    /// Scan-order index of the first point in the run.
+    pub start: usize,
     pub lo_100ns: u32,
     pub hi_100ns: u32,
     /// Median p50 of the run, in milliseconds.
@@ -174,19 +141,31 @@ pub struct Plateau {
 /// Collapse the measured curve into plateaus for display.
 ///
 /// Points arrive in scan order, which is period order, so a plateau is a
-/// contiguous run whose p50 stays within `BAND_MARGIN_MS` of its first member.
+/// contiguous run whose p50 span stays within `BAND_MARGIN_MS`. Tracking the
+/// running min and max (not the first point) keeps a monotonic drift from
+/// hiding inside one plateau.
 pub fn plateaus(points: &[Stats]) -> Vec<Plateau> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < points.len() {
-        let anchor = points[i].p50_ms;
+        let mut lo = points[i].p50_ms;
+        let mut hi = lo;
         let mut j = i + 1;
-        while j < points.len() && (points[j].p50_ms - anchor).abs() <= BAND_MARGIN_MS {
+        while j < points.len() {
+            let v = points[j].p50_ms;
+            let next_lo = lo.min(v);
+            let next_hi = hi.max(v);
+            if next_hi - next_lo > BAND_MARGIN_MS {
+                break;
+            }
+            lo = next_lo;
+            hi = next_hi;
             j += 1;
         }
         let mut p50s: Vec<f64> = points[i..j].iter().map(|s| s.p50_ms).collect();
         p50s.sort_by(f64::total_cmp);
         out.push(Plateau {
+            start: i,
             lo_100ns: points[i].period_100ns,
             hi_100ns: points[j - 1].period_100ns,
             p50_ms: p50s[p50s.len() / 2],
@@ -208,13 +187,21 @@ pub enum Verdict {
     Inconclusive,
 }
 
+/// Baseline at or below this is already as fast as the request we made, so the
+/// child cannot tell the modes apart. A 1 ms tick still sleeps ~2 ms, so even
+/// the slowest "already fine" baseline stays under this.
+const BASELINE_ALREADY_FAST_MS: f64 = 1.5;
+
 /// Compare a no-request baseline against a child process measured while this
-/// process held the finest request. `2.0` ms separates "still on the coarse
-/// tick" from "already getting ~1 ms".
+/// process held the finest request.
+///
+/// The ratio is the discriminator, not an absolute cutoff: a machine whose
+/// ambient tick is 1 ms measures ~2 ms either way, so only a child that is
+/// clearly faster than the baseline proves the request crossed into it.
 pub fn classify_global(baseline_ms: f64, child_ms: f64) -> Verdict {
-    if baseline_ms <= 2.0 {
+    if baseline_ms <= BASELINE_ALREADY_FAST_MS {
         Verdict::Inconclusive
-    } else if child_ms <= 2.0 {
+    } else if child_ms <= baseline_ms * 0.75 {
         Verdict::Global
     } else {
         Verdict::PerProcess
@@ -345,25 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn latency_prefers_lowest_score_among_usable() {
-        let stats = vec![
-            stat(4000, 1.05, 1.6, 0.0),  // score 1.325
-            stat(5120, 1.10, 1.2, 0.0),  // score 1.15  <- best
-            stat(6000, 1.20, 1.3, 0.0),  // score 1.25
-            stat(3000, 0.90, 0.95, 0.0), // score 0.925 but not usable
-            stat(7000, 1.10, 1.2, 0.5),  // same score, interference
-        ];
-        assert_eq!(choose(&stats, Prefer::Latency), Some(1));
-
-        // Tie on score -> smaller period wins.
-        let tie = vec![stat(6000, 1.10, 1.2, 0.0), stat(5000, 1.10, 1.2, 0.0)];
-        assert_eq!(choose(&tie, Prefer::Latency), Some(1));
-
-        let none = vec![stat(5000, 0.5, 0.6, 0.0)];
-        assert_eq!(choose(&none, Prefer::Latency), None);
-    }
-
-    #[test]
     fn band_is_the_plateau_and_the_middle_wins() {
         let stats = vec![
             stat(5000, 1.505, 1.51, 0.0),
@@ -375,19 +343,34 @@ mod tests {
             stat(5133, 1.513, 1.52, 0.0),
             stat(5200, 1.518, 1.52, 0.0),
         ];
-        let (index, (lo, hi)) = choose_band(&stats).unwrap();
-        assert_eq!((lo, hi), (5106, 5132));
+        let (index, band) = choose_band(&stats).unwrap();
+        assert_eq!((band.lo_100ns, band.hi_100ns, band.points), (5106, 5132, 4));
         assert_eq!(stats[index].period_100ns, 5120); // middle 5119, nearest measured
         assert!(stats[index].p50_ms < 1.1);
 
         // A single usable point is its own band.
         let lone = vec![stat(5000, 1.4, 1.6, 0.0), stat(6000, 1.2, 1.5, 0.0)];
         let (index, band) = choose_band(&lone).unwrap();
-        assert_eq!(band, (6000, 6000));
+        assert_eq!((band.lo_100ns, band.hi_100ns, band.points), (6000, 6000, 1));
         assert_eq!(index, 1);
 
         let none = vec![stat(5000, 0.5, 0.6, 0.0)];
         assert!(choose_band(&none).is_none());
+    }
+
+    #[test]
+    fn band_never_spans_a_gap() {
+        // A stray fast-looking point far above the plateau must not widen the
+        // band and claim every period in between is equivalent.
+        let stats = vec![
+            stat(5000, 1.505, 1.51, 0.0),
+            stat(5106, 1.017, 1.52, 0.0),
+            stat(5110, 1.020, 1.52, 0.0),
+            stat(5200, 1.519, 1.52, 0.0),
+            stat(5400, 1.030, 1.40, 0.0), // isolated, low p50
+        ];
+        let (_, band) = choose_band(&stats).unwrap();
+        assert_eq!((band.lo_100ns, band.hi_100ns), (5106, 5110));
     }
 
     #[test]
@@ -405,11 +388,28 @@ mod tests {
         let g = plateaus(&points);
         assert_eq!(g.len(), 3);
         assert_eq!(
-            (g[1].lo_100ns, g[1].hi_100ns, g[1].points),
-            (5106, 5132, 27)
+            (g[1].start, g[1].lo_100ns, g[1].hi_100ns, g[1].points),
+            (11, 5106, 5132, 27)
         );
         assert_eq!(g[2].lo_100ns, 5133);
         assert_eq!(g.iter().map(|p| p.points).sum::<usize>(), points.len());
+    }
+
+    #[test]
+    fn plateau_tracks_running_span_not_the_first_point() {
+        // A 0.06 ms drift is a change of setting, not one plateau.
+        let drift: Vec<Stats> = (0..11)
+            .map(|k| stat(5000 + k, 1.00 + 0.006 * k as f64, 1.2, 0.0))
+            .collect();
+        assert!(plateaus(&drift).len() > 1);
+
+        // A V shape that ends where it started is still a 0.10 ms spread.
+        let v = vec![
+            stat(5000, 1.00, 1.2, 0.0),
+            stat(5001, 1.10, 1.2, 0.0),
+            stat(5002, 1.00, 1.2, 0.0),
+        ];
+        assert!(plateaus(&v).len() > 1);
     }
 
     #[test]
@@ -420,18 +420,24 @@ mod tests {
             stat(8000, 1.30, 1.9, 0.0), // coarsest within budget <- best
             stat(9000, 1.40, 1.5, 0.0), // usable, p50 too high for budget
         ];
-        assert_eq!(choose(&stats, Prefer::Power), Some(2));
+        assert_eq!(coarsest_within_budget(&stats), Some(2));
 
-        // Tie on period -> lower score wins.
-        let tie = vec![stat(7000, 1.20, 1.5, 0.0), stat(7000, 1.10, 1.3, 0.0)];
-        assert_eq!(choose(&tie, Prefer::Power), Some(1));
+        // Nothing within budget.
+        let none = vec![stat(5000, 1.50, 1.6, 0.0), stat(6000, 1.45, 1.5, 0.0)];
+        assert_eq!(coarsest_within_budget(&none), None);
+    }
 
-        // Nothing within budget -> latency fallback.
-        let fallback = vec![
-            stat(5000, 1.50, 1.6, 0.0), // score 1.55
-            stat(6000, 1.45, 1.5, 0.0), // score 1.475 <- best
-        ];
-        assert_eq!(choose(&fallback, Prefer::Power), Some(1));
+    #[test]
+    fn global_verdict_is_relative_to_the_baseline() {
+        assert_eq!(classify_global(15.6, 1.0), Verdict::Global);
+        assert_eq!(classify_global(15.6, 15.6), Verdict::PerProcess);
+        // A 1 ms ambient tick sleeps ~2 ms; a child that stays there did not
+        // see the request, so this is a per-process answer, not ambiguity.
+        assert_eq!(classify_global(2.0, 2.0), Verdict::PerProcess);
+        assert_eq!(classify_global(2.0, 1.0), Verdict::Global);
+        // Already as fast as the request: the child cannot discriminate.
+        assert_eq!(classify_global(1.0, 1.0), Verdict::Inconclusive);
+        assert_eq!(classify_global(1.5, 1.5), Verdict::Inconclusive);
     }
 
     #[test]

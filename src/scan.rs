@@ -1,15 +1,13 @@
 //! Dense sweep of the low band, coarse sweep of the rest, then a stability re-check.
 
-use std::io::IsTerminal;
 use std::time::Duration;
 
 use crate::measure;
 use crate::nt::{self, Range};
-use crate::stats::{self, ms, Prefer, Stats};
+use crate::stats::{self, ms, Plateau, Prefer, Stats};
 
 pub struct Options {
-    pub samples_coarse: usize,
-    pub samples_fine: usize,
+    pub samples: usize,
     pub prefer: Prefer,
 }
 
@@ -18,24 +16,27 @@ pub struct Report {
     /// Every measured point, in scan order.
     pub points: Vec<Stats>,
     pub chosen: Option<Stats>,
-    /// Period range of the plateau the recommendation came from.
-    pub band: Option<(u32, u32)>,
-    /// Whether the dense winner reproduced within 40 us on a second pass.
+    /// The plateau the recommendation came from, when it came from one.
+    pub band: Option<Plateau>,
+    /// The power pick is the last value inside the budget; the next one is not.
+    pub power_edge: bool,
+    /// Whether the winner reproduced within 40 us on a second pass.
     pub stable: bool,
-    /// The user stopped the scan with ESC before it finished.
+    /// The user stopped the scan before it finished.
     pub partial: bool,
 }
 
 /// Progress goes to stderr so `timres bench > results.txt` stays clean.
 pub fn run(opts: &Options) -> Result<Report, String> {
+    // Two benches share one tick, so each would corrupt the other's curve.
+    let _guard = nt::bench_instance()?;
+
     let range = nt::query()?;
-    // Requesters share the finest period anyone asks for, so a candidate above
-    // another process's request cannot be measured. Near the 1 ms ceiling this
-    // only affects the last row, where the warning would be noise.
-    if range.current.saturating_add(stats::COARSE_STEP_100NS) <= stats::MAX_USEFUL_100NS {
+    // A request below the scanned ceiling props up every candidate above it.
+    // A holder at or above 1 ms never meets a scanned candidate, so stay quiet.
+    if range.current < stats::MAX_USEFUL_100NS {
         eprintln!(
-            "warning: another process holds a {:.3} ms request. Candidates above that measure \
-             the same value; close it for an accurate upper range.",
+            "warning: another process holds a {:.3} ms request. Candidates above that measure the same value; close it for an accurate upper range.",
             ms(range.current)
         );
     }
@@ -65,9 +66,8 @@ fn measure_point(period: u32, samples: usize) -> Result<Stats, String> {
     Ok(Stats::from_samples(period, &mut durations))
 }
 
-/// One line, rewritten in place: 546 lines of numbers is not progress.
 fn progress(done: usize, total: usize, period: u32) {
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
     if std::io::stderr().is_terminal() {
         let _ = write!(
             std::io::stderr(),
@@ -78,64 +78,55 @@ fn progress(done: usize, total: usize, period: u32) {
 }
 
 fn end_progress() {
+    use std::io::{IsTerminal, Write};
     if std::io::stderr().is_terminal() {
-        eprintln!();
+        let _ = writeln!(std::io::stderr());
     }
 }
 
 fn scan(opts: &Options, range: Range) -> Result<Report, String> {
-    let dense = stats::dense_grid(range.finest, range.coarsest);
-    let coarse = stats::coarse_grid(range.finest, range.coarsest);
-    let total = dense.len() + coarse.len();
-    let mut points = Vec::new();
+    let list: Vec<u32> = stats::dense_grid(range.finest, range.coarsest)
+        .into_iter()
+        .chain(stats::coarse_grid(range.finest, range.coarsest))
+        .collect();
+    let total = list.len();
+    let mut points = Vec::with_capacity(total);
     let mut partial = false;
-    // Drain any ESC press from before the scan so it does not stop it at once.
+
+    // Drain a press that happened before the scan started.
     let _ = measure::escape_pressed();
 
-    // Fixed dense window: outside the knee every coarse row measures the same,
-    // so a coarse winner there is noise and must not decide where this runs.
-    for &period in &dense {
+    for period in list {
         if measure::escape_pressed() {
             partial = true;
             break;
         }
-        points.push(measure_point(period, opts.samples_fine)?);
+        points.push(measure_point(period, opts.samples)?);
         progress(points.len(), total, period);
     }
-
-    if !partial {
-        for &period in &coarse {
-            if measure::escape_pressed() {
-                partial = true;
-                break;
-            }
-            points.push(measure_point(period, opts.samples_coarse)?);
-            progress(points.len(), total, period);
-        }
-    }
     end_progress();
-
-    let (chosen, band) = match opts.prefer {
-        Prefer::Power => match stats::choose(&points, Prefer::Power) {
-            // A value inside the budget is a real choice, not a plateau tie.
-            Some(i) if points[i].within_budget() => (Some(points[i].clone()), None),
-            _ => match stats::choose_band(&points) {
-                Some((i, b)) => (Some(points[i].clone()), Some(b)),
-                None => (None, None),
-            },
-        },
-        Prefer::Latency => match stats::choose_band(&points) {
-            Some((i, b)) => (Some(points[i].clone()), Some(b)),
-            None => (None, None),
-        },
-    };
     if partial {
         eprintln!("  stopped (ESC) after {} points", points.len());
     }
-    let stable = match &chosen {
-        Some(c) if !partial => {
-            eprintln!("  re-checking {:.4} ms", ms(c.period_100ns));
-            let again = measure_point(c.period_100ns, opts.samples_fine)?;
+
+    let pick = match opts.prefer {
+        Prefer::Latency => stats::choose_band(&points).map(|(i, band)| (i, Some(band), false)),
+        Prefer::Power => stats::coarsest_within_budget(&points)
+            .map(|i| {
+                let edge = points.get(i + 1).is_some_and(|next| !next.within_budget());
+                (i, None, edge)
+            })
+            // Nothing inside the budget: fall back to the latency winner.
+            .or_else(|| stats::choose_band(&points).map(|(i, band)| (i, Some(band), false))),
+    };
+    let (chosen, band, power_edge) = match pick {
+        Some((i, band, edge)) => (Some(points[i].clone()), band, edge),
+        None => (None, None, false),
+    };
+
+    let stable = match (&chosen, partial) {
+        (Some(c), false) => {
+            let again = measure_point(c.period_100ns, opts.samples)?;
             (again.p50_ms - c.p50_ms).abs() <= 0.04
         }
         _ => false,
@@ -146,6 +137,7 @@ fn scan(opts: &Options, range: Range) -> Result<Report, String> {
         points,
         chosen,
         band,
+        power_edge,
         stable,
         partial,
     })

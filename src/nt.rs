@@ -57,6 +57,8 @@ extern "system" {
     fn SetThreadPriority(thread: Handle, priority: i32) -> i32;
     fn GetThreadPriority(thread: Handle) -> i32;
     fn SetProcessInformation(process: Handle, class: u32, info: *mut c_void, size: u32) -> i32;
+    fn CreateMutexW(security: *mut c_void, owner: i32, name: *const u16) -> Handle;
+    fn GetLastError() -> u32;
     fn CloseHandle(handle: Handle) -> i32;
 }
 
@@ -211,6 +213,36 @@ const TIME_CRITICAL: i32 = 15;
 pub fn prepare_sampling() {
     ignore_timer_resolution_throttling();
     set_thread_priority(TIME_CRITICAL);
+}
+
+/// Held for as long as the process runs; the name is released on drop.
+pub struct InstanceGuard(Handle);
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+const ERROR_ALREADY_EXISTS: u32 = 183;
+
+/// Claim the bench name for this process. Two benches share one tick, so each
+/// would measure the other's request instead of its own.
+pub fn bench_instance() -> Result<InstanceGuard, String> {
+    let name = wide("Local\\timres-bench");
+    let handle = unsafe { CreateMutexW(core::ptr::null_mut(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err("CreateMutexW failed".to_string());
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe {
+            CloseHandle(handle);
+        }
+        return Err("another timres bench is already running; wait for it to finish".to_string());
+    }
+    Ok(InstanceGuard(handle))
 }
 
 /// `GlobalTimerResolutionRequests` DWORD, if the key exists.
