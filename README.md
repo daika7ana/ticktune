@@ -4,6 +4,7 @@
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)](https://github.com/daika7ana/win-timer-resolution)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](Cargo.toml)
 [![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org)
+[![CI](https://github.com/daika7ana/win-timer-resolution/actions/workflows/ci.yml/badge.svg)](https://github.com/daika7ana/win-timer-resolution/actions/workflows/ci.yml)
 
 Measure the timer resolution Windows actually delivers, then request the best one.
 
@@ -124,11 +125,13 @@ cleanup, no leftover state.
 timres apply --resolution 5120 --persist --no-console
 ```
 
-This writes a small `.vbs` to the Startup folder that starts the holder at logon
-with no console window.
+This registers a Task Scheduler task named `timres` that runs the holder 15 s
+after logon: least privilege, allowed on battery, and with no execution time limit
+(a default task would stop it after 72 hours). Open Task Scheduler to inspect or
+edit it, or delete it with `timres startup remove`.
 It is refused unless `GlobalTimerResolutionRequests` is `1`, because in per-process
 mode the holder would only accelerate itself. Check it after the next logon with
-`timres status`. The launcher stores the exe path, so rebuild or move the binary and
+`timres status`. The task stores the exe path, so rebuild or move the binary and
 you must run `--persist` again — `query` marks the old one as `stale`.
 
 ### 7. Undo everything
@@ -220,7 +223,7 @@ cargo build --release --target x86_64-pc-windows-gnu
 | `src/measure.rs` | `Sleep(1)` sampler on QPC |
 | `src/scan.rs` | dense low band, coarse sweep, stability re-check |
 | `src/nt.rs` | `NtSetTimerResolution` / `NtQueryTimerResolution`, registry, BCD probe |
-| `src/persist.rs` | logon `.vbs` in the Startup folder |
+| `src/persist.rs` | logon task in Task Scheduler (`schtasks`) |
 | `src/main.rs` | CLI |
 
 ## License

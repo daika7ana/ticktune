@@ -169,21 +169,23 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             None if elevated => outln!("{:<20}unset (default: enabled)", "dynamic tick"),
             None => outln!("{:<20}unknown (run elevated to read)", "dynamic tick"),
         }
-        let startup = match persist::startup_period() {
-            Some(p) => {
-                let path = persist::startup_script_path()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|e| e);
-                let stale = if persist::startup_stale() {
-                    " (stale: launcher points at another exe)"
+        let startup = match persist::logon_task() {
+            Some(task) => {
+                let stale = if task.stale {
+                    " (stale: task points at another exe)"
                 } else {
                     ""
                 };
-                format!("{} ms ({}){}", fmt_period(p), path, stale)
+                format!(
+                    "{} task: {} x 100ns{}",
+                    persist::TASK_NAME,
+                    task.period_100ns,
+                    stale
+                )
             }
             None => "none".to_string(),
         };
-        outln!("{:<20}{}", "startup", startup);
+        outln!("{:<20}{}", "logon", startup);
         outln!("{:<20}{}", "elevated", if elevated { "yes" } else { "no" });
     }
 
@@ -432,8 +434,11 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         }
         outln!("requesting {} ms", fmt_period(period));
         if persist {
-            let path = persist::install_startup(period).map_err(Fail::Op)?;
-            outln!("startup: {}", path.display());
+            persist::install_startup(period).map_err(Fail::Op)?;
+            outln!(
+                "logon task: {} (starts at logon; edit it in Task Scheduler)",
+                persist::TASK_NAME
+            );
         }
         outln!("holding request; close this process to release.");
         // Detach only after all output: printing to a freed console panics.
@@ -564,7 +569,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             Some("remove") if args.len() == 1 => {
                 let removed = persist::remove_startup().map_err(Fail::Op)?;
                 outln!(
-                    "startup: {}",
+                    "logon task: {}",
                     if removed { "removed" } else { "not installed" }
                 );
                 if removed {
