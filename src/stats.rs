@@ -132,6 +132,71 @@ pub fn choose(stats: &[Stats], prefer: Prefer) -> Option<usize> {
     }
 }
 
+/// How close to the best median a point must be to count as the same setting.
+/// The quantisation plateaus are ~0.5 ms apart, so this separates them easily.
+pub const BAND_MARGIN_MS: f64 = 0.05;
+
+/// Index of the recommended point and the period band it belongs to.
+///
+/// Inside the fast band every period measures the same, so the argmin is noise.
+/// Recommend the middle of the band instead: the edges are marginal by
+/// definition, and the middle reproduces across runs.
+pub fn choose_band(points: &[Stats]) -> Option<(usize, (u32, u32))> {
+    let best = points
+        .iter()
+        .filter(|s| s.usable())
+        .min_by(|a, b| a.p50_ms.total_cmp(&b.p50_ms))?;
+    let limit = best.p50_ms + BAND_MARGIN_MS;
+    let members: Vec<(usize, &Stats)> = points
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.usable() && s.p50_ms <= limit)
+        .collect();
+    let lo = members.iter().map(|(_, s)| s.period_100ns).min()?;
+    let hi = members.iter().map(|(_, s)| s.period_100ns).max()?;
+    let mid = lo + (hi - lo) / 2;
+    let (index, _) = *members
+        .iter()
+        .min_by_key(|(_, s)| s.period_100ns.abs_diff(mid))?;
+    Some((index, (lo, hi)))
+}
+
+/// A run of consecutive measured points that behave the same.
+#[derive(Clone, Copy, Debug)]
+pub struct Plateau {
+    pub lo_100ns: u32,
+    pub hi_100ns: u32,
+    /// Median p50 of the run, in milliseconds.
+    pub p50_ms: f64,
+    pub points: usize,
+}
+
+/// Collapse the measured curve into plateaus for display.
+///
+/// Points arrive in scan order, which is period order, so a plateau is a
+/// contiguous run whose p50 stays within `BAND_MARGIN_MS` of its first member.
+pub fn plateaus(points: &[Stats]) -> Vec<Plateau> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < points.len() {
+        let anchor = points[i].p50_ms;
+        let mut j = i + 1;
+        while j < points.len() && (points[j].p50_ms - anchor).abs() <= BAND_MARGIN_MS {
+            j += 1;
+        }
+        let mut p50s: Vec<f64> = points[i..j].iter().map(|s| s.p50_ms).collect();
+        p50s.sort_by(f64::total_cmp);
+        out.push(Plateau {
+            lo_100ns: points[i].period_100ns,
+            hi_100ns: points[j - 1].period_100ns,
+            p50_ms: p50s[p50s.len() / 2],
+            points: j - i,
+        });
+        i = j;
+    }
+    out
+}
+
 /// What a two-process measurement says about `GlobalTimerResolutionRequests`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
@@ -296,6 +361,55 @@ mod tests {
 
         let none = vec![stat(5000, 0.5, 0.6, 0.0)];
         assert_eq!(choose(&none, Prefer::Latency), None);
+    }
+
+    #[test]
+    fn band_is_the_plateau_and_the_middle_wins() {
+        let stats = vec![
+            stat(5000, 1.505, 1.51, 0.0),
+            stat(5100, 1.510, 1.52, 0.0),
+            stat(5106, 1.026, 1.52, 0.0),
+            stat(5110, 1.017, 1.52, 0.0), // best p50
+            stat(5120, 1.022, 1.52, 0.0),
+            stat(5132, 1.028, 1.52, 0.0),
+            stat(5133, 1.513, 1.52, 0.0),
+            stat(5200, 1.518, 1.52, 0.0),
+        ];
+        let (index, (lo, hi)) = choose_band(&stats).unwrap();
+        assert_eq!((lo, hi), (5106, 5132));
+        assert_eq!(stats[index].period_100ns, 5120); // middle 5119, nearest measured
+        assert!(stats[index].p50_ms < 1.1);
+
+        // A single usable point is its own band.
+        let lone = vec![stat(5000, 1.4, 1.6, 0.0), stat(6000, 1.2, 1.5, 0.0)];
+        let (index, band) = choose_band(&lone).unwrap();
+        assert_eq!(band, (6000, 6000));
+        assert_eq!(index, 1);
+
+        let none = vec![stat(5000, 0.5, 0.6, 0.0)];
+        assert!(choose_band(&none).is_none());
+    }
+
+    #[test]
+    fn plateaus_collapse_the_curve() {
+        let mut points = Vec::new();
+        for p in (5000..5106).step_by(10) {
+            points.push(stat(p, 1.505, 1.51, 0.0));
+        }
+        for p in 5106..=5132 {
+            points.push(stat(p, 1.017, 1.52, 0.0));
+        }
+        for p in (5133..=5200).step_by(10) {
+            points.push(stat(p, 1.518, 1.52, 0.0));
+        }
+        let g = plateaus(&points);
+        assert_eq!(g.len(), 3);
+        assert_eq!(
+            (g[1].lo_100ns, g[1].hi_100ns, g[1].points),
+            (5106, 5132, 27)
+        );
+        assert_eq!(g[2].lo_100ns, 5133);
+        assert_eq!(g.iter().map(|p| p.points).sum::<usize>(), points.len());
     }
 
     #[test]

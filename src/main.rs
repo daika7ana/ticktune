@@ -19,13 +19,14 @@ mod cli {
     use crate::scan;
     use crate::stats::{self, Prefer, Stats, Verdict};
 
-    const USAGE: &str = "usage: timres query | bench [--samples N] [--prefer latency|power] | \
+    const USAGE: &str =
+        "usage: timres query | bench [--samples N] [--prefer latency|power] [--rows] | \
 apply (--resolution <100ns> | --ms <f64>) [--persist] [--no-console] | status | \
 measure [--samples N] | verify-global | global on|off | startup remove";
 
-    /// Samples per point in a bench run. 547 points at 500 samples is already
-    /// ~6 minutes; a larger number would look like a hang.
-    const MAX_BENCH_SAMPLES: usize = 500;
+    /// Samples per point in a bench run. 547 points at 1000 samples is ~11
+    /// minutes; a larger number would look like a hang.
+    const MAX_BENCH_SAMPLES: usize = 1000;
 
     /// stdout may be a closed pipe (`timres bench | head`); a failed write must
     /// not abort the scan.
@@ -179,6 +180,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
     fn cmd_bench(args: &[String]) -> Result<(), Fail> {
         let mut samples: Option<usize> = None;
         let mut prefer = Prefer::Latency;
+        let mut rows = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -186,6 +188,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
                     let v = take(args, &mut i, "--samples")?;
                     samples = Some(parse_samples(v)?);
                 }
+                "--rows" => rows = true,
                 "--prefer" => {
                     let v = take(args, &mut i, "--prefer")?;
                     prefer = match v {
@@ -205,9 +208,9 @@ measure [--samples N] | verify-global | global on|off | startup remove";
 
         let (coarse, fine) = match samples {
             Some(n) if n > MAX_BENCH_SAMPLES => {
-                out(format_args!(
-                    "note: bench caps --samples at {MAX_BENCH_SAMPLES} so a run stays under ~6 minutes"
-                ));
+                eprintln!(
+                    "note: bench caps --samples at {MAX_BENCH_SAMPLES} so a run stays under ~12 minutes"
+                );
                 (MAX_BENCH_SAMPLES, MAX_BENCH_SAMPLES)
             }
             Some(n) => (n, n),
@@ -220,54 +223,127 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         })
         .map_err(Fail::Op)?;
 
+        out(format_args!("timres bench"));
+        out(format_args!(""));
         out(format_args!(
-            "range: {} - {} ms, global tick {} ms",
+            "  {:<12}{} - {} ms",
+            "range",
             fmt_period(report.range.finest),
-            fmt_period(report.range.coarsest),
-            fmt_period(report.range.current),
+            fmt_period(report.range.coarsest)
         ));
         out(format_args!(
-            "{:<8} {:>8} {:>8} {:>7}",
-            "request", "p50", "p95", "interf"
+            "  {:<12}{} ms",
+            "global tick",
+            fmt_period(report.range.current)
         ));
-        for p in &report.points {
-            out(format_args!(
-                "{:<8} {:>8.3} {:>8.3} {:>6.1}%",
-                fmt_period(p.period_100ns),
-                p.p50_ms,
-                p.p95_ms,
-                p.interference * 100.0,
-            ));
-        }
+        out(format_args!(""));
 
         let chosen = match report.chosen {
             Some(c) => c,
+            None if report.partial => {
+                return Err(Fail::Op(
+                    "stopped with ESC before any candidate was usable".into(),
+                ))
+            }
             None => {
                 return Err(Fail::Op(
                     "no point met the usability thresholds (interference or latency)".into(),
                 ))
             }
         };
-        let label = match (prefer, chosen.within_budget()) {
-            (Prefer::Power, true) => "recommend (power):",
-            (Prefer::Power, false) => "recommend (power, latency fallback):",
-            (Prefer::Latency, _) => "recommend:",
-        };
-        let stability = if report.stable {
-            "[stable]"
+
+        if rows {
+            out(format_args!("curve  (every measured period)"));
+            out(format_args!(
+                "  {:<8} {:>8} {:>8} {:>7}",
+                "request", "p50", "p95", "interf"
+            ));
+            for p in &report.points {
+                out(format_args!(
+                    "  {:<8} {:>8.3} {:>8.3} {:>6.1}%",
+                    fmt_period(p.period_100ns),
+                    p.p50_ms,
+                    p.p95_ms,
+                    p.interference * 100.0,
+                ));
+            }
         } else {
-            "[unstable: rerun]"
+            out(format_args!("curve  (median p50 per plateau)"));
+            for g in stats::plateaus(&report.points) {
+                let mark = if (g.lo_100ns..=g.hi_100ns).contains(&chosen.period_100ns) {
+                    "  <- recommended"
+                } else {
+                    ""
+                };
+                out(format_args!(
+                    "  {} - {} ms   p50 {:.3} ms  {:>4} points{}",
+                    fmt_period(g.lo_100ns),
+                    fmt_period(g.hi_100ns),
+                    g.p50_ms,
+                    g.points,
+                    mark
+                ));
+            }
+        }
+
+        out(format_args!(""));
+        out(format_args!("result"));
+        let suffix = match (prefer, chosen.within_budget()) {
+            (Prefer::Latency, _) => "",
+            (Prefer::Power, true) => "  [power]",
+            (Prefer::Power, false) => "  [power fallback]",
         };
         out(format_args!(
-            "{} {} ms  ({} x 100ns)  min={:.3} p50={:.3} p95={:.3} max={:.3} {}",
-            label,
+            "  {:<12}{} ms  ({} x 100ns){}",
+            "recommend",
             fmt_period(chosen.period_100ns),
             chosen.period_100ns,
-            chosen.min_ms,
-            chosen.p50_ms,
-            chosen.p95_ms,
-            chosen.max_ms,
-            stability,
+            suffix
+        ));
+        if let Some((lo, hi)) = report.band {
+            if lo != hi {
+                out(format_args!(
+                    "  {:<12}{} - {} ms  ({} values, all equivalent)",
+                    "band",
+                    fmt_period(lo),
+                    fmt_period(hi),
+                    hi - lo + 1
+                ));
+            }
+        }
+        out(format_args!(
+            "  {:<12}min {:.3}   p50 {:.3}   p95 {:.3}   max {:.3} ms",
+            "latency", chosen.min_ms, chosen.p50_ms, chosen.p95_ms, chosen.max_ms
+        ));
+        if let Some(floor) = report
+            .points
+            .iter()
+            .find(|p| p.period_100ns == report.range.finest)
+        {
+            if floor.period_100ns != chosen.period_100ns && floor.p50_ms > 0.0 {
+                let gain = (floor.p50_ms - chosen.p50_ms) / floor.p50_ms * 100.0;
+                if gain >= 1.0 {
+                    out(format_args!(
+                        "  {:<12}p50 {:.3} ms at {} ms  ({:.0}% lower)",
+                        "vs floor",
+                        floor.p50_ms,
+                        fmt_period(floor.period_100ns),
+                        gain
+                    ));
+                }
+            }
+        }
+        let stability = if report.partial {
+            "partial (stopped with ESC)"
+        } else if report.stable {
+            "stable (re-check agreed)"
+        } else {
+            "unstable (rerun when the machine is quieter)"
+        };
+        out(format_args!("  {:<12}{}", "stability", stability));
+        out(format_args!(
+            "  {:<12}timres apply --resolution {}",
+            "next step", chosen.period_100ns
         ));
         Ok(())
     }

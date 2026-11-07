@@ -12,6 +12,19 @@ extern "system" {
     fn Sleep(ms: u32);
 }
 
+#[link(name = "user32")]
+extern "system" {
+    fn GetAsyncKeyState(key: i32) -> i16;
+}
+
+/// True when ESC was pressed since the previous call. Checked between scan
+/// points, so a long bench can be stopped without killing the process (which
+/// would leave a partial, unexplained report).
+pub fn escape_pressed() -> bool {
+    const VK_ESCAPE: i32 = 0x1B;
+    unsafe { GetAsyncKeyState(VK_ESCAPE) & 1 != 0 }
+}
+
 /// QPC frequency never changes during a boot, so read it once.
 static QPC_FREQ_HZ: OnceLock<i64> = OnceLock::new();
 

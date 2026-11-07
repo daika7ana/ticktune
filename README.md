@@ -69,12 +69,38 @@ period without input — see the **Before you benchmark** note below.
 timres bench
 ```
 
-The scan takes two to three minutes. It prints one row per tested period
-(p50, p95, interference) and a final recommendation. `[stable]` means a re-check
-of the winner agreed with the first pass; `[unstable]` means the machine was noisy —
-rerun when it is quieter. `--samples 100` gives a quicker, noisier answer; values
-above 500 are capped. Use `--prefer power` if you would rather have the coarsest
-period inside the latency budget.
+The scan takes two to three minutes and prints a short report:
+
+```
+timres bench
+
+  range       0.5000 - 15.6250 ms
+  global tick 1.0000 ms
+
+curve  (median p50 per plateau)
+  0.5000 - 0.5105 ms   p50 1.505 ms    32 points
+  0.5106 - 0.5132 ms   p50 1.019 ms    27 points  <- recommended
+  0.5133 - 1.0000 ms   p50 1.518 ms   487 points
+
+result
+  recommend   0.5119 ms  (5119 x 100ns)
+  band        0.5106 - 0.5132 ms  (27 values, all equivalent)
+  latency     min 1.008   p50 1.017   p95 1.517   max 1.525 ms
+  vs floor    p50 1.505 ms at 0.5000 ms  (32% lower)
+  stability   stable (re-check agreed)
+  next step   timres apply --resolution 5119
+```
+
+The curve is collapsed into plateaus because 500+ identical rows are noise. Add
+`--rows` to see every measured period. When several neighbouring periods measure
+the same, the tool reports that band and recommends its middle: the edges of a
+plateau are marginal by definition, so repeated runs agree on the middle and only
+the edge rows wobble. `stable` means a re-check of the winner agreed with the first
+pass; `unstable` means the machine was noisy — rerun when it is quieter.
+`--samples 100` gives a quicker, noisier answer; values above 1000 are capped.
+Press `ESC` to stop early — the recommendation then covers the points measured so
+far. Use `--prefer power` if you would rather have the coarsest period inside the
+latency budget.
 
 ### 5. Try the value
 
@@ -112,7 +138,7 @@ Close any holder that is still running. No other state is left behind.
 | Command | What it does |
 |---|---|
 | `timres query` | Print the nominal range, global tick, mode and dynamic-tick state |
-| `timres bench [--samples N] [--prefer latency\|power]` | Scan and recommend |
+| `timres bench [--samples N] [--prefer latency\|power] [--rows]` | Scan and recommend |
 | `timres apply --resolution <100ns>` | Hold a period for this process |
 | `timres apply --ms <float>` | Same, in milliseconds |
 | `timres status` | What this process really gets, next to what Windows reports |
