@@ -19,10 +19,40 @@ mod cli {
     use crate::scan;
     use crate::stats::{self, Prefer, Stats, Verdict};
 
-    const USAGE: &str =
-        "usage: timres query | bench [--samples N] [--prefer latency|power] [--rows] | \
-apply (--resolution <100ns> | --ms <f64>) [--persist] [--no-console] [--no-esc] | status | \
-measure [--samples N] | verify-global | global on|off | startup remove";
+    /// One line for errors; `--help` prints the full table.
+    const USAGE: &str = "usage: timres <command> [options] (run `timres --help`)";
+
+    const HELP: &str = "\
+usage: timres <command> [options]
+
+commands:
+  query                     show the timer range, mode, and current state
+  bench                     measure the timer curve and recommend a period
+  apply                     hold one timer request until ESC or Ctrl+C
+  status                    sample this process, then print the query block
+  measure                   print p50/p95/interference for this process
+  verify-global             check whether requests affect other processes
+  global on|off             set GlobalTimerResolutionRequests (admin, reboot)
+  startup remove            delete the logon task
+  help                      show this help
+
+options:
+  -h, --help                show this help; works after any command
+  --resolution <100ns>      apply: period in 100 ns units
+  --ms <f64>                apply: period in milliseconds
+  --persist                 apply: install and start the logon holder
+  --no-console              apply: detach the console (no Ctrl+C)
+  --no-esc                  apply: internal, used by the generated logon task
+  --samples N               bench: per point (default 200, max 1000)
+                            measure: total (default 1000, max 100000)
+  --prefer latency|power    bench: optimize for latency (default) or power
+  --rows                    bench: print every measured period, not plateaus
+
+notes:
+  apply needs exactly one of --resolution or --ms, within the platform range.
+  apply --persist requires GlobalTimerResolutionRequests=1 (see verify-global).
+  bench stops early on ESC; --samples 1000 takes about 13 minutes.
+  startup remove leaves a holder that is already running until logout.";
 
     /// Samples per point in a bench run. 547 points at 1000 samples is ~11
     /// minutes; a larger number would look like a hang.
@@ -91,7 +121,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         let args: Vec<String> = std::env::args().skip(1).collect();
         // `--help` works in any position, including after a subcommand.
         if args.iter().any(|a| a == "--help" || a == "-h") {
-            outln!("{USAGE}");
+            outln!("{HELP}");
             return Ok(());
         }
         let cmd = match args.first() {
@@ -118,7 +148,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             "global" => cmd_global(rest),
             "startup" => cmd_startup(rest),
             "help" => {
-                outln!("{USAGE}");
+                outln!("{HELP}");
                 Ok(())
             }
             other => Err(Fail::Usage(format!("unknown subcommand: {other}"))),
@@ -392,7 +422,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
                 }
                 "--persist" => persist = true,
                 "--no-console" => no_console = true,
-                "--no-esc" => esc = false,
+                "--no-esc" => esc = false, // internal: the generated logon task is the only caller
                 a => return Err(Fail::Usage(format!("unknown apply argument: {a}"))),
             }
             i += 1;

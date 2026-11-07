@@ -43,6 +43,8 @@ fn schtasks_exe() -> String {
 fn task_xml(exe: &str, period_100ns: u32) -> String {
     // A logon task with no execution time limit (the holder blocks forever),
     // allowed on battery, and run as the invoking user without elevation.
+    // StopExisting: re-running `apply --persist` must replace a live holder,
+    // not have its `/Run` dropped while the old period keeps winning.
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
@@ -62,7 +64,7 @@ fn task_xml(exe: &str, period_100ns: u32) -> String {
     </Principal>\r\n\
   </Principals>\r\n\
   <Settings>\r\n\
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n\
+    <MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>\r\n\
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n\
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n\
     <AllowHardTerminate>true</AllowHardTerminate>\r\n\
@@ -278,6 +280,15 @@ mod tests {
         );
         let args = extract_tag(&xml, "Arguments").unwrap();
         assert_eq!(parse_period(&args), Some(5119));
+    }
+
+    #[test]
+    fn logon_task_does_not_poll_esc() {
+        // ESC is read desktop-wide; without --no-esc any window's ESC would
+        // end the holder.
+        let xml = task_xml("C:\\timres.exe", 5000);
+        let args = extract_tag(&xml, "Arguments").unwrap();
+        assert!(args.contains("--no-esc"), "arguments were: {args}");
     }
 
     #[test]
