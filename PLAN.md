@@ -28,8 +28,10 @@ when that process exits. Other processes only benefit if
 This is why `bench.ps1` measures in a *separate* process and still works: the guide
 sets that key first. It also means the tool has two distinct modes:
 
-- **self** — request is honoured by this process (a game, an encoder) — no admin.
+- **self** — the request is honoured by this process, and only by this process;
+  it cannot speed up another application — no admin.
 - **system** — one requester affects everything — admin + registry + reboot.
+  `apply` is only useful for other applications in this mode.
 
 **B. Sleep granularity is quantised and non-monotonic.**
 Observed in the bundled `results.csv`: 0.500 ms → slept ≈ 1.50 ms (3 ticks),
@@ -90,14 +92,16 @@ interference`. Also one pass with
 `CreateWaitableTimerEx(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)` because that is
 what a game or audio client actually uses — the two can disagree.
 
-**M3 — scan** (`scan.c`). Two-pass, in-place:
+**M3 — scan** (`scan.rs`). Two-pass, in-place:
 1. coarse: `[min_available, 1.0 ms]`, 10 µs step, 200 samples per point (~15 s)
-2. fine: best ± 15 µs, 2 µs step, 1000 samples per point (~20 s)
-3. repeat pass 2 once; reject the result if the chosen value moves > 4 µs
-   between passes, unless interference explains it.
+2. dense: `[best − 10 µs, best]`, **100 ns step** (one representable unit),
+   200 samples per point (~25 s). The knee where `Sleep(1)` drops from three
+   ticks to two sits a few microseconds above `min_available` and is under
+   1 µs wide on builds 26200/26300, so a 2 µs step can walk straight over it.
+3. repeat the dense winner once; reject the result if p50 moves > 40 µs.
 
 Changing the request is a **replace, not a restart** — no process spawning, no
-1 s settle. This alone takes the run from ~5 min to ~1 min. Record power plan,
+1 s settle. This alone takes the run from ~5 min to ~40 s. Record power plan,
 AC/battery and hypervisor state with the result; refuse to compare across a change.
 
 **M4 — apply / persist** (`persist.c`). Self mode: the process must stay alive
@@ -117,9 +121,27 @@ a plain `shell:startup` shortcut otherwise.
 
 **M5 — validation.** A/B against the bundled `MeasureSleep.exe` at fixed values
 (run it with global mode on, since it is a separate process). Repeatability: 5
-runs, chosen value within 4 µs. Cross-check `powercfg /energy` attribution.
+runs, chosen value within 40 µs. Cross-check `powercfg /energy` attribution.
 Then: desktop, laptop on battery, hybrid P/E-core, and a VM (expected to fail —
 that is a test too).
+
+## 4a. Platform notes (checked 2026-10)
+
+- Windows 11 **25H2 = build 26200**, **26H2 = build 26300**. Neither changes the
+  timer API, the per-process model, or tick-rate semantics. **26H1 = build
+  28000** is a device-scoped release, so build numbers do not order the versions —
+  never gate behaviour on "build ≥ N".
+- `GlobalTimerResolutionRequests` still works on 26200/26300: behaviourally
+  verified — absent → ~15.6 ms sleeps, `1` → ~1.01 ms measured from a process
+  that requests nothing. Still boot-only, still undocumented, still the only way
+  to get machine-wide behaviour.
+- The knee moved: 5023 (26100) → **5018** (26200/26300), and the fast window on
+  26300 is only ~5018–5025. `0.5000 ms` is on the slow (3-tick) side there. That
+  is why the dense pass exists and why no value is hardcoded.
+- New since 2025: a "Medium" QoS level plus a user-inactivity demotion. Microsoft
+  warns that benchmarks without user input can be silently lowered mid-run. Set
+  `HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling\DisableUserPresenceQos = 1`
+  (REG_DWORD) before a benchmark run. The tool reports, never writes it.
 
 ## 5. Risks
 

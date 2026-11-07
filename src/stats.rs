@@ -24,8 +24,6 @@ pub struct Stats {
     pub max_ms: f64,
     /// Fraction of samples that look preempted rather than timer-quantised.
     pub interference: f64,
-    /// Most likely whole number of ticks per `Sleep(1)`, i.e. `round(p50 / period)`.
-    pub ticks: u32,
 }
 
 impl Stats {
@@ -42,7 +40,6 @@ impl Stats {
                 p95_ms: 0.0,
                 max_ms: 0.0,
                 interference: 0.0,
-                ticks: 0,
             };
         }
 
@@ -59,12 +56,6 @@ impl Stats {
             samples.iter().filter(|&&s| s > limit).count() as f64 / n as f64
         };
 
-        let ticks = if period_100ns == 0 {
-            0
-        } else {
-            ((p50_ms / ms(period_100ns)).round() as u32).max(1)
-        };
-
         Stats {
             period_100ns,
             n,
@@ -73,7 +64,6 @@ impl Stats {
             p95_ms: pct(0.95),
             max_ms: samples[n - 1],
             interference,
-            ticks,
         }
     }
 
@@ -83,8 +73,11 @@ impl Stats {
     }
 
     /// Safe to recommend at all: low interference, no early wake-ups.
+    ///
+    /// The coarse pass only takes 200 samples, so 1 % would mean two hiccups
+    /// reject the point; 2 % still catches a genuinely noisy run.
     pub fn usable(&self) -> bool {
-        self.n > 0 && self.interference < 0.01 && self.p50_ms >= 1.0 && self.p95_ms <= 2.5
+        self.n > 0 && self.interference <= 0.02 && self.p50_ms >= 0.99 && self.p95_ms <= 2.5
     }
 
     /// Inside the latency budget, i.e. a candidate for `Prefer::Power`.
@@ -138,6 +131,30 @@ pub fn choose(stats: &[Stats], prefer: Prefer) -> Option<usize> {
     }
 }
 
+/// What a two-process measurement says about `GlobalTimerResolutionRequests`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// A process that requested nothing saw the finer tick.
+    Global,
+    /// A process that requested nothing kept the coarse tick.
+    PerProcess,
+    /// The baseline was already fine, so nothing can be concluded.
+    Inconclusive,
+}
+
+/// Compare a no-request baseline against a child process measured while this
+/// process held the finest request. `2.0` ms separates "still on the coarse
+/// tick" from "already getting ~1 ms".
+pub fn classify_global(baseline_ms: f64, child_ms: f64) -> Verdict {
+    if baseline_ms <= 2.0 {
+        Verdict::Inconclusive
+    } else if child_ms <= 2.0 {
+        Verdict::Global
+    } else {
+        Verdict::PerProcess
+    }
+}
+
 /// Convert a period in 100 ns units to milliseconds.
 pub fn ms(period_100ns: u32) -> f64 {
     period_100ns as f64 / 10_000.0
@@ -145,10 +162,10 @@ pub fn ms(period_100ns: u32) -> f64 {
 
 /// Coarse scan step: 10 us.
 pub const COARSE_STEP_100NS: u32 = 100;
-/// Fine scan step: 2 us.
-pub const FINE_STEP_100NS: u32 = 20;
-/// Fine scan half-width around the coarse winner: 15 us.
-pub const FINE_SPAN_100NS: u32 = 150;
+/// Fine scan step: one representable timer unit (100 ns). The knee where
+/// `Sleep(1)` drops from three ticks to two is under 1 us wide on recent
+/// builds, so a coarser step can walk straight over it.
+pub const FINE_STEP_100NS: u32 = 1;
 /// Nothing above 1 ms is worth scanning: `Sleep(1)` already takes 2 ticks there.
 pub const MAX_USEFUL_100NS: u32 = 10_000;
 
@@ -171,13 +188,18 @@ pub fn coarse_grid(finest: u32, coarsest: u32) -> Vec<u32> {
     v
 }
 
-/// Fine sweep around `best` (+-15 us), clamped to the platform range.
+/// Dense sweep around the coarse winner, where the tick boundary lives.
+///
+/// The coarse grid steps by 10 us, so the knee is within 10 us of `best` on
+/// either side: the winner can sit at the very bottom of the range, where a
+/// downward-only sweep would collapse to a single point. Stepping one unit at a
+/// time makes the search exhaustive over every value the kernel can be asked for.
 pub fn fine_grid(best: u32, finest: u32, coarsest: u32) -> Vec<u32> {
-    let lo = best.saturating_sub(FINE_SPAN_100NS).max(finest);
     let hi = best
-        .saturating_add(FINE_SPAN_100NS)
+        .saturating_add(COARSE_STEP_100NS)
         .min(coarsest)
         .min(MAX_USEFUL_100NS);
+    let lo = best.saturating_sub(COARSE_STEP_100NS).max(finest);
     if lo > hi {
         return vec![best];
     }
@@ -190,9 +212,6 @@ pub fn fine_grid(best: u32, finest: u32, coarsest: u32) -> Vec<u32> {
             None => break,
         }
     }
-    v.push(best);
-    v.sort_unstable();
-    v.dedup();
     v
 }
 
@@ -214,7 +233,6 @@ mod tests {
             p95_ms: p95,
             max_ms: p95,
             interference,
-            ticks: 1,
         }
     }
 
@@ -236,16 +254,12 @@ mod tests {
         let mut empty: [f64; 0] = [];
         let e = Stats::from_samples(5120, &mut empty);
         assert_eq!(e.n, 0);
-        assert_eq!(e.ticks, 0);
         assert_eq!(e.p50_ms, 0.0);
 
-        let mut a = [1.5];
-        assert_eq!(Stats::from_samples(5000, &mut a).ticks, 3);
-        let mut b = [1.02];
-        assert_eq!(Stats::from_samples(5120, &mut b).ticks, 2);
-        // period 0 must not divide by zero.
+        // A period of 0 must not be used as a divisor anywhere.
         let mut c = [1.5];
-        assert_eq!(Stats::from_samples(0, &mut c).ticks, 0);
+        let s = Stats::from_samples(0, &mut c);
+        assert_eq!(s.p50_ms, 1.5);
     }
 
     #[test]
@@ -324,13 +338,38 @@ mod tests {
         assert!(f.iter().all(|&p| (5000..=10_000).contains(&p)));
         assert!(f.windows(2).all(|w| w[1] - w[0] == FINE_STEP_100NS));
         assert_eq!(f.first(), Some(&5000)); // best - span clamped to finest
+        assert_eq!(f.last(), Some(&5200)); // the knee can be above the winner
 
         let clamped = fine_grid(9900, 5000, 20_000);
         assert!(clamped.contains(&9900));
         assert!(clamped.iter().all(|&p| p <= MAX_USEFUL_100NS));
-        assert_eq!(clamped.last(), Some(&9990));
+        assert_eq!(clamped.last(), Some(&MAX_USEFUL_100NS));
 
         // lo > hi -> only best.
         assert_eq!(fine_grid(100, 500, 600), vec![100]);
+    }
+
+    #[test]
+    fn dense_grid_covers_the_tick_knee() {
+        // Builds 26200/26300 put the 3-tick -> 2-tick knee around 5018-5025.
+        let f = fine_grid(5100, 5000, 20_000);
+        assert_eq!(f.len(), 201);
+        assert!(f.contains(&5018) && f.contains(&5023));
+
+        // A coarse winner at the very bottom of the range still sweeps upward,
+        // which is where the knee is when 0.5000 ms is on the slow side.
+        let floor = fine_grid(5000, 5000, 20_000);
+        assert_eq!(floor.len(), 101);
+        assert_eq!(floor.first(), Some(&5000));
+        assert!(floor.contains(&5018) && floor.contains(&5100));
+    }
+
+    #[test]
+    fn global_verdict_has_three_outcomes() {
+        assert_eq!(classify_global(15.6, 1.02), Verdict::Global);
+        assert_eq!(classify_global(15.6, 1.43), Verdict::Global);
+        assert_eq!(classify_global(15.6, 15.5), Verdict::PerProcess);
+        // Something already holds a fine request: no conclusion possible.
+        assert_eq!(classify_global(1.02, 1.02), Verdict::Inconclusive);
     }
 }

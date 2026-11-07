@@ -26,10 +26,10 @@ const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_ELEVATION_CLASS: u32 = 20;
 
 const PROCESS_POWER_THROTTLING: u32 = 4;
-const IGNORE_TIMER_RESOLUTION: u32 = 1;
-
-const THREAD_PRIORITY_NORMAL: i32 = 0;
-const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+/// `PROCESS_POWER_THROTTLING_EXECUTION_SPEED`.
+const EXECUTION_SPEED: u32 = 0x1;
+/// `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` — 0x4, not 0x1.
+const IGNORE_TIMER_RESOLUTION: u32 = 0x4;
 
 const HKEY_LOCAL_MACHINE: Hkey = 0x8000_0002_isize as Hkey;
 const KEY_SET_VALUE: u32 = 0x0002;
@@ -55,6 +55,7 @@ extern "system" {
     fn GetCurrentProcess() -> Handle;
     fn GetCurrentThread() -> Handle;
     fn SetThreadPriority(thread: Handle, priority: i32) -> i32;
+    fn GetThreadPriority(thread: Handle) -> i32;
     fn SetProcessInformation(process: Handle, class: u32, info: *mut c_void, size: u32) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
 }
@@ -119,18 +120,21 @@ pub fn query() -> Result<Range, String> {
     })
 }
 
-/// Request `period_100ns` for this process. Replaces any previous request.
-/// Returns the period actually granted.
-pub fn set(period_100ns: u32) -> Result<u32, String> {
-    let mut granted = 0u32;
-    let status = unsafe { NtSetTimerResolution(period_100ns, 1, &mut granted) };
+/// Request `period_100ns` for this process, replacing any previous request.
+///
+/// The kernel's `ActualTime` out-param is deliberately discarded: on current
+/// builds it reports the finest resolution (0.5000 ms) no matter what was
+/// accepted, so only a timing sample shows whether the request took effect.
+pub fn set(period_100ns: u32) -> Result<(), String> {
+    let mut reported = 0u32;
+    let status = unsafe { NtSetTimerResolution(period_100ns, 1, &mut reported) };
     if status != STATUS_SUCCESS {
         return Err(format!(
             "NtSetTimerResolution failed: 0x{:08X}",
             status as u32
         ));
     }
-    Ok(granted)
+    Ok(())
 }
 
 /// Release this process's request. Harmless to call twice.
@@ -171,25 +175,29 @@ pub fn is_elevated() -> bool {
 /// Keep the process out of EcoQoS so an occluded window cannot silently drop
 /// our timer-resolution guarantee. Best effort, ignore failure.
 pub fn ignore_timer_resolution_throttling() {
-    // PROCESS_POWER_THROTTLING_STATE { Version, ControlMask, StateMask }
-    let mut state = [1u32, IGNORE_TIMER_RESOLUTION, IGNORE_TIMER_RESOLUTION];
-    unsafe {
+    // PROCESS_POWER_THROTTLING_STATE { Version, ControlMask, StateMask }.
+    // A set StateMask bit turns a control ON; zero means "do not throttle".
+    let mut state = [1u32, EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION, 0];
+    let ok = unsafe {
         SetProcessInformation(
             GetCurrentProcess(),
             PROCESS_POWER_THROTTLING,
             state.as_mut_ptr() as *mut c_void,
             core::mem::size_of_val(&state) as u32,
-        );
+        )
+    };
+    if ok == 0 {
+        eprintln!("warning: could not opt out of power throttling");
     }
 }
 
-/// Raise or restore the current thread priority for sampling.
-pub fn set_thread_time_critical(on: bool) {
-    let priority = if on {
-        THREAD_PRIORITY_TIME_CRITICAL
-    } else {
-        THREAD_PRIORITY_NORMAL
-    };
+/// Current thread priority, so the sampler can restore the caller's value.
+pub fn thread_priority() -> i32 {
+    unsafe { GetThreadPriority(GetCurrentThread()) }
+}
+
+/// Set the current thread priority. Best effort.
+pub fn set_thread_priority(priority: i32) {
     unsafe {
         SetThreadPriority(GetCurrentThread(), priority);
     }
@@ -261,7 +269,13 @@ pub fn dynamic_tick_disabled() -> Option<bool> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let out = std::process::Command::new("bcdedit")
+    // Resolve through SystemRoot so an attacker-writable PATH entry cannot
+    // substitute its own bcdedit.
+    let bcdedit = match std::env::var("SystemRoot") {
+        Ok(root) => format!("{root}\\System32\\bcdedit.exe"),
+        Err(_) => "bcdedit".to_string(),
+    };
+    let out = std::process::Command::new(bcdedit)
         .args(["/enum", "{current}"])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -276,8 +290,8 @@ pub fn dynamic_tick_disabled() -> Option<bool> {
             continue;
         }
         return match parts.next() {
-            Some("Yes") => Some(true),
-            Some("No") => Some(false),
+            Some(v) if v.eq_ignore_ascii_case("yes") => Some(true),
+            Some(v) if v.eq_ignore_ascii_case("no") => Some(false),
             _ => None,
         };
     }

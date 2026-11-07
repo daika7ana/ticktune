@@ -46,7 +46,7 @@ pub fn sample_sleep(samples: usize) -> Vec<f64> {
     }
 
     let mut out = Vec::with_capacity(samples);
-    for i in 0..samples + WARMUP {
+    for i in 0..samples.saturating_add(WARMUP) {
         let start = qpc_now_ms();
         unsafe { Sleep(1) };
         let elapsed = qpc_now_ms() - start;

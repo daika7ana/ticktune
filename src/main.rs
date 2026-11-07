@@ -17,7 +17,7 @@ mod cli {
     use crate::nt;
     use crate::persist;
     use crate::scan;
-    use crate::stats::{self, Prefer, Stats};
+    use crate::stats::{self, Prefer, Stats, Verdict};
 
     const USAGE: &str = "usage: timres query | bench [--samples N] [--prefer latency|power] | \
 apply (--resolution <100ns> | --ms <f64>) [--persist] [--no-console] | status | \
@@ -42,6 +42,23 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         args.get(*i)
             .map(String::as_str)
             .ok_or_else(|| Fail::Usage(format!("{flag} requires a value")))
+    }
+
+    /// Cap sample counts so a typo cannot allocate or run for days.
+    fn parse_samples(v: &str) -> Result<usize, Fail> {
+        let n: usize = v
+            .parse()
+            .map_err(|_| Fail::Usage(format!("invalid --samples: {v}")))?;
+        if n == 0 {
+            return Err(Fail::Usage("--samples must be at least 1".into()));
+        }
+        Ok(n.min(100_000))
+    }
+
+    /// Short-lived measurement paths: no power throttling, highest priority.
+    fn prepare_sampling() {
+        nt::ignore_timer_resolution_throttling();
+        nt::set_thread_priority(15);
     }
 
     pub fn run() -> i32 {
@@ -90,30 +107,36 @@ measure [--samples N] | verify-global | global on|off | startup remove";
 
     fn print_query_block(range: &nt::Range) -> Result<(), Fail> {
         println!(
-            "{:<12}{} ms  ({} x 100ns)",
+            "{:<20}{} ms  ({} x 100ns)",
             "finest",
             fmt_period(range.finest),
             range.finest
         );
         println!(
-            "{:<12}{} ms  ({} x 100ns)",
+            "{:<20}{} ms  ({} x 100ns)",
             "coarsest",
             fmt_period(range.coarsest),
             range.coarsest
         );
-        println!("{:<12}{} ms", "global tick", fmt_period(range.current));
+        println!("{:<20}{} ms", "global tick", fmt_period(range.current));
         let mode = match nt::global_requests_enabled() {
             Some(1) => "global (GlobalTimerResolutionRequests=1)",
             Some(0) => "per-process (GlobalTimerResolutionRequests=0)",
             _ => "per-process",
         };
-        println!("{:<12}{}", "mode", mode);
-        let dyn_tick = match nt::dynamic_tick_disabled() {
-            Some(true) => "disabled (! risk)",
-            Some(false) => "enabled",
-            None => "unknown",
-        };
-        println!("{:<12}{}", "dynamic tick", dyn_tick);
+        println!("{:<20}{}", "mode", mode);
+        match nt::dynamic_tick_disabled() {
+            Some(true) => {
+                println!("{:<20}disabled (! risk)", "dynamic tick");
+                println!("{:<20}revert: bcdedit /deletevalue disabledynamictick", "");
+            }
+            Some(false) => println!("{:<20}enabled", "dynamic tick"),
+            // bcdedit omits the line when it was never set, which is the default.
+            None if nt::is_elevated() => {
+                println!("{:<20}unset (default: enabled)", "dynamic tick")
+            }
+            None => println!("{:<20}unknown (run elevated to read)", "dynamic tick"),
+        }
         let startup = match persist::startup_period() {
             Some(p) => {
                 let path = persist::startup_script_path()
@@ -123,9 +146,9 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             }
             None => "none".to_string(),
         };
-        println!("{:<12}{}", "startup", startup);
+        println!("{:<20}{}", "startup", startup);
         println!(
-            "{:<12}{}",
+            "{:<20}{}",
             "elevated",
             if nt::is_elevated() { "yes" } else { "no" }
         );
@@ -140,10 +163,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             match args[i].as_str() {
                 "--samples" => {
                     let v = take(args, &mut i, "--samples")?;
-                    samples = Some(
-                        v.parse()
-                            .map_err(|_| Fail::Usage(format!("invalid --samples: {v}")))?,
-                    );
+                    samples = Some(parse_samples(v)?);
                 }
                 "--prefer" => {
                     let v = take(args, &mut i, "--prefer")?;
@@ -164,7 +184,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
 
         let (coarse, fine) = match samples {
             Some(n) => (n.min(1000), n),
-            None => (200, 1000),
+            None => (200, 200),
         };
         let report = scan::run(&scan::Options {
             samples_coarse: coarse,
@@ -179,17 +199,22 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             fmt_period(report.range.coarsest),
             fmt_period(report.range.current),
         );
-        println!(
-            "{:<8} {:>8} {:>8} {:>6} {:>7}",
-            "request", "p50", "p95", "ticks", "interf"
-        );
-        for p in &report.points {
+        println!("{:<8} {:>8} {:>8} {:>7}", "request", "p50", "p95", "interf");
+        // The dense pass re-measures coarse points; print each request once,
+        // keeping the later (more sampled) row.
+        let mut seen = std::collections::HashSet::new();
+        let rows: Vec<_> = report
+            .points
+            .iter()
+            .rev()
+            .filter(|p| seen.insert(p.period_100ns))
+            .collect();
+        for p in rows.into_iter().rev() {
             println!(
-                "{:<8} {:>8.3} {:>8.3} {:>6} {:>6.1}%",
+                "{:<8} {:>8.3} {:>8.3} {:>6.1}%",
                 fmt_period(p.period_100ns),
                 p.p50_ms,
                 p.p95_ms,
-                p.ticks,
                 p.interference * 100.0,
             );
         }
@@ -202,10 +227,10 @@ measure [--samples N] | verify-global | global on|off | startup remove";
                 ))
             }
         };
-        let label = if prefer == Prefer::Power {
-            "recommend (power):"
-        } else {
-            "recommend:"
+        let label = match (prefer, chosen.within_budget()) {
+            (Prefer::Power, true) => "recommend (power):",
+            (Prefer::Power, false) => "recommend (power, latency fallback):",
+            (Prefer::Latency, _) => "recommend:",
         };
         let stability = if report.stable {
             "[stable]"
@@ -213,7 +238,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             "[unstable: rerun]"
         };
         println!(
-            "{} {} ms  ({} x 100ns)  min={:.3} p50={:.3} p95={:.3} max={:.3} ticks={} {}",
+            "{} {} ms  ({} x 100ns)  min={:.3} p50={:.3} p95={:.3} max={:.3} {}",
             label,
             fmt_period(chosen.period_100ns),
             chosen.period_100ns,
@@ -221,7 +246,6 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             chosen.p50_ms,
             chosen.p95_ms,
             chosen.max_ms,
-            chosen.ticks,
             stability,
         );
         Ok(())
@@ -266,24 +290,38 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             }
         };
 
-        nt::ignore_timer_resolution_throttling();
-        if no_console {
-            unsafe {
-                FreeConsole();
+        let range = nt::query().map_err(Fail::Op)?;
+        if period < range.finest || period > range.coarsest {
+            return Err(Fail::Usage(format!(
+                "{period} x 100ns is outside the platform range {}..{}",
+                range.finest, range.coarsest
+            )));
+        }
+
+        if nt::global_requests_enabled() != Some(1) {
+            eprintln!("warning: requests are per-process here, so this affects timres.exe only.");
+            eprintln!("         run `timres global on` (admin) and reboot for other applications.");
+            if persist {
+                return Err(Fail::Usage(
+                    "refusing --persist: the logon holder would only affect itself. Enable global mode and reboot first.".into(),
+                ));
             }
         }
 
-        let granted = nt::set(period).map_err(Fail::Op)?;
-        println!(
-            "requested {} ms, granted {} ms",
-            fmt_period(period),
-            fmt_period(granted)
-        );
+        prepare_sampling();
+        nt::set(period).map_err(Fail::Op)?;
+        println!("requesting {} ms", fmt_period(period));
         if persist {
             let path = persist::install_startup(period).map_err(Fail::Op)?;
             println!("startup: {}", path.display());
         }
         println!("holding request; close this process to release.");
+        // Detach only after all output: printing to a freed console panics.
+        if no_console {
+            unsafe {
+                FreeConsole();
+            }
+        }
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         }
@@ -291,14 +329,14 @@ measure [--samples N] | verify-global | global on|off | startup remove";
 
     fn cmd_status() -> Result<(), Fail> {
         let range = nt::query().map_err(Fail::Op)?;
+        prepare_sampling();
         let mut v = measure::sample_sleep(1000);
         let s = Stats::from_samples(range.current, &mut v);
         println!("effective (this process)");
         println!(
-            "p50={:.3} p95={:.3} ticks={} interference={:.1}%",
+            "p50={:.3} p95={:.3} interference={:.1}%",
             s.p50_ms,
             s.p95_ms,
-            s.ticks,
             s.interference * 100.0,
         );
         if nt::global_requests_enabled() == Some(1) {
@@ -314,28 +352,28 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             match args[i].as_str() {
                 "--samples" => {
                     let v = take(args, &mut i, "--samples")?;
-                    samples = v
-                        .parse()
-                        .map_err(|_| Fail::Usage(format!("invalid --samples: {v}")))?;
+                    samples = parse_samples(v)?;
                 }
                 a => return Err(Fail::Usage(format!("unknown measure argument: {a}"))),
             }
             i += 1;
         }
 
+        let range = nt::query().map_err(Fail::Op)?;
+        prepare_sampling();
         let mut v = measure::sample_sleep(samples);
-        let s = Stats::from_samples(0, &mut v);
+        let s = Stats::from_samples(range.current, &mut v);
         println!(
-            "p50={:.3} p95={:.3} ticks={} interference={:.1}%",
+            "p50={:.3} p95={:.3} interference={:.1}%",
             s.p50_ms,
             s.p95_ms,
-            s.ticks,
             s.interference * 100.0,
         );
         Ok(())
     }
 
     fn cmd_verify_global() -> Result<(), Fail> {
+        prepare_sampling();
         let mut v = measure::sample_sleep(500);
         let base = Stats::from_samples(0, &mut v);
         println!("baseline p50={:.3} ms", base.p50_ms);
@@ -366,14 +404,22 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             .and_then(|v| v.parse::<f64>().ok())
             .ok_or_else(|| Fail::Op(format!("could not parse child output: {}", text.trim())))?;
 
-        if child < baseline * 0.9 {
-            println!("global: yes - a child process saw the finer tick");
-        } else {
-            println!(
-                "global: NO - requests are per-process on this machine (child p50={:.3}, baseline={:.3})",
-                child, baseline,
-            );
-            println!("enabling requires GlobalTimerResolutionRequests=1 and a reboot.");
+        match stats::classify_global(baseline, child) {
+            Verdict::Global => println!("global: yes - a child process saw the finer tick"),
+            Verdict::PerProcess => {
+                println!(
+                    "global: NO - requests are per-process on this machine (child p50={:.3}, baseline={:.3})",
+                    child, baseline,
+                );
+                println!("enabling requires GlobalTimerResolutionRequests=1 and a reboot.");
+            }
+            Verdict::Inconclusive => {
+                println!(
+                    "global: inconclusive - the baseline is already {:.3} ms, so something else holds a fine request.",
+                    baseline,
+                );
+                println!("close it and rerun to get a real answer.");
+            }
         }
         Ok(())
     }
@@ -400,6 +446,9 @@ measure [--samples N] | verify-global | global on|off | startup remove";
                     "startup: {}",
                     if removed { "removed" } else { "not installed" }
                 );
+                if removed {
+                    println!("note: a holder started at logon keeps running until you log out.");
+                }
                 Ok(())
             }
             Some("remove") => Err(Fail::Usage("startup remove takes no arguments".into())),
