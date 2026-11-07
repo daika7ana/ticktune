@@ -435,20 +435,36 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         outln!("requesting {} ms", fmt_period(period));
         if persist {
             persist::install_startup(period).map_err(Fail::Op)?;
-            outln!(
-                "logon task: {} (starts at logon; edit it in Task Scheduler)",
-                persist::TASK_NAME
-            );
+            // The task owns the request from here, so this process can exit
+            // instead of blocking the shell that started it.
+            match persist::start_startup() {
+                Ok(()) => outln!(
+                    "logon task: {} installed and running (edit it in Task Scheduler)",
+                    persist::TASK_NAME
+                ),
+                Err(e) => {
+                    eprintln!("warning: task installed but could not start now: {e}");
+                    eprintln!("         it will start at the next logon.");
+                }
+            }
+            return Ok(());
         }
-        outln!("holding request; close this process to release.");
-        // Detach only after all output: printing to a freed console panics.
+        outln!("holding request; press ESC or Ctrl+C to release.");
+        // With a console, Ctrl+C terminates the process and the kernel drops the
+        // request with it. --no-console keeps the holder windowless, which also
+        // removes Ctrl+C, so ESC is polled either way.
         if no_console {
             unsafe {
                 FreeConsole();
             }
         }
+        let _ = measure::escape_pressed(); // drop a press from before we started
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+            if measure::escape_pressed() {
+                outln!("released (ESC)");
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 

@@ -112,6 +112,19 @@ pub fn install_startup(period_100ns: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Start the registered task now, so `apply --persist` does not have to keep
+/// its own process alive to deliver the request.
+pub fn start_startup() -> Result<(), String> {
+    let out = schtasks()
+        .args(["/Run", "/TN", TASK_NAME])
+        .output()
+        .map_err(|e| format!("run schtasks: {e}"))?;
+    if !out.status.success() {
+        return Err(command_error("/Run", &out));
+    }
+    Ok(())
+}
+
 /// Delete the task and any launcher left by an older build.
 pub fn remove_startup() -> Result<bool, String> {
     let existed = logon_task().is_some();
