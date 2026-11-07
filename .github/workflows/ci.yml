@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Windows cross toolchain
         run: |
@@ -31,3 +31,17 @@ jobs:
 
       - name: Build (Windows)
         run: cargo build --release --target x86_64-pc-windows-gnu
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test
+        run: cargo test
+
+      - name: "Smoke: query"
+        run: cargo run --release -- query
+
+      - name: "Smoke: measure"
+        run: cargo run --release -- measure --samples 20

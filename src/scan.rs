@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use crate::cli::err;
 use crate::measure;
 use crate::nt::{self, Range};
 use crate::stats::{self, Plateau, Prefer, Stats, ms};
@@ -35,10 +36,10 @@ pub fn run(opts: &Options) -> Result<Report, String> {
     // A request below the scanned ceiling props up every candidate above it.
     // A holder at or above 1 ms never meets a scanned candidate, so stay quiet.
     if range.current < stats::MAX_USEFUL_100NS {
-        eprintln!(
+        err(format_args!(
             "warning: another process holds a {:.3} ms request. Candidates above that measure the same value; close it for an accurate upper range.",
             ms(range.current)
-        );
+        ));
     }
     // Remember the caller's priority rather than assuming it was normal.
     let previous_priority = nt::thread_priority();
@@ -106,7 +107,10 @@ fn scan(opts: &Options, range: Range) -> Result<Report, String> {
     }
     end_progress();
     if partial {
-        eprintln!("  stopped (ESC) after {} points", points.len());
+        err(format_args!(
+            "  stopped (ESC) after {} points",
+            points.len()
+        ));
     }
 
     let pick = match opts.prefer {

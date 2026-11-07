@@ -37,6 +37,9 @@ const REG_OPTION_NON_VOLATILE: u32 = 0x0000_0000;
 const REG_DWORD: u32 = 4;
 const RRF_RT_REG_DWORD: u32 = 0x10;
 
+/// `CREATE_NO_WINDOW`: start a helper without flashing a console.
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 const KERNEL_KEY: &str = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel";
 const GLOBAL_VALUE: &str = "GlobalTimerResolutionRequests";
 
@@ -189,7 +192,9 @@ pub fn ignore_timer_resolution_throttling() {
         )
     };
     if ok == 0 {
-        eprintln!("warning: could not opt out of power throttling");
+        crate::cli::err(format_args!(
+            "warning: could not opt out of power throttling"
+        ));
     }
 }
 
@@ -306,17 +311,20 @@ pub fn set_global_requests(on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve a System32 tool through %SystemRoot% so a writable PATH entry
+/// cannot substitute its own binary.
+pub fn system32(tool: &str) -> String {
+    match std::env::var("SystemRoot") {
+        Ok(root) => format!("{root}\\System32\\{tool}"),
+        Err(_) => tool.to_string(),
+    }
+}
+
 /// Read `disabledynamictick` from BCD. `None` if it cannot be read (needs admin).
 pub fn dynamic_tick_disabled() -> Option<bool> {
     use std::os::windows::process::CommandExt;
 
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Resolve through SystemRoot so an attacker-writable PATH entry cannot
-    // substitute its own bcdedit.
-    let bcdedit = match std::env::var("SystemRoot") {
-        Ok(root) => format!("{root}\\System32\\bcdedit.exe"),
-        Err(_) => "bcdedit".to_string(),
-    };
+    let bcdedit = system32("bcdedit.exe");
     let out = std::process::Command::new(bcdedit)
         .args(["/enum", "{current}"])
         .creation_flags(CREATE_NO_WINDOW)

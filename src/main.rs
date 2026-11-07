@@ -70,6 +70,17 @@ notes:
         ($($t:tt)*) => { out(format_args!($($t)*)) };
     }
 
+    /// stderr may be closed by a wrapper; a failed write must not abort a run.
+    pub(crate) fn err(args: std::fmt::Arguments<'_>) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{args}");
+    }
+
+    /// `eprintln!` for stderr that may be closed.
+    macro_rules! errln {
+        ($($t:tt)*) => { err(format_args!($($t)*)) };
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn FreeConsole() -> i32;
@@ -106,12 +117,12 @@ notes:
         match dispatch() {
             Ok(()) => 0,
             Err(Fail::Usage(m)) => {
-                eprintln!("error: {m}");
-                eprintln!("{USAGE}");
+                errln!("error: {m}");
+                errln!("{USAGE}");
                 2
             }
             Err(Fail::Op(m)) => {
-                eprintln!("error: {m}");
+                errln!("error: {m}");
                 1
             }
         }
@@ -213,6 +224,7 @@ notes:
                     stale
                 )
             }
+            None if persist::task_exists() => "present (arguments unreadable)".to_string(),
             None => "none".to_string(),
         };
         outln!("{:<20}{}", "logon", startup);
@@ -250,7 +262,7 @@ notes:
 
         let samples = match samples {
             Some(n) if n > MAX_BENCH_SAMPLES => {
-                eprintln!(
+                errln!(
                     "note: bench caps --samples at {MAX_BENCH_SAMPLES} so a run stays under ~13 minutes"
                 );
                 MAX_BENCH_SAMPLES
@@ -447,21 +459,19 @@ notes:
         }
 
         if nt::global_requests_enabled() != Some(1) {
-            eprintln!("warning: requests are per-process here, so this affects ticktune.exe only.");
-            eprintln!(
-                "         run `ticktune global on` (admin) and reboot for other applications."
-            );
+            errln!("warning: requests are per-process here, so this affects ticktune.exe only.");
+            errln!("         run `ticktune global on` (admin) and reboot for other applications.");
             if persist {
-                return Err(Fail::Usage(
+                return Err(Fail::Op(
                     "refusing --persist: the logon holder would only affect itself. Enable global mode and reboot first.".into(),
                 ));
             }
         }
 
-        nt::prepare_sampling();
+        nt::ignore_timer_resolution_throttling();
         nt::set(period).map_err(Fail::Op)?;
         if range.current < period {
-            eprintln!(
+            errln!(
                 "note: another process holds a finer {:.3} ms request; the timer stays at that resolution, so this will not lower power use until it exits.",
                 stats::ms(range.current)
             );
@@ -477,8 +487,8 @@ notes:
                     persist::TASK_NAME
                 ),
                 Err(e) => {
-                    eprintln!("warning: task installed but could not start now: {e}");
-                    eprintln!("         it will start at the next logon.");
+                    errln!("warning: task installed but could not start now: {e}");
+                    errln!("         it will start at the next logon.");
                 }
             }
             return Ok(());
@@ -512,18 +522,23 @@ notes:
         }
     }
 
-    fn cmd_status() -> Result<(), Fail> {
-        let range = nt::query().map_err(Fail::Op)?;
+    /// Prepare, sample once, and print the effective distribution.
+    fn sample_and_print(samples: usize) {
         nt::prepare_sampling();
-        let mut v = measure::sample_sleep(1000);
+        let mut v = measure::sample_sleep(samples);
         let s = Stats::from_samples(0, &mut v);
-        outln!("effective (this process)");
         outln!(
             "p50={:.3} p95={:.3} interference={:.1}%",
             s.p50_ms,
             s.p95_ms,
             s.interference * 100.0,
         );
+    }
+
+    fn cmd_status() -> Result<(), Fail> {
+        let range = nt::query().map_err(Fail::Op)?;
+        outln!("effective (this process)");
+        sample_and_print(1000);
         outln!(
             "note: this process made no request; the value above is the ambient tick shared by every process"
         );
@@ -545,15 +560,7 @@ notes:
             i += 1;
         }
 
-        nt::prepare_sampling();
-        let mut v = measure::sample_sleep(samples);
-        let s = Stats::from_samples(0, &mut v);
-        outln!(
-            "p50={:.3} p95={:.3} interference={:.1}%",
-            s.p50_ms,
-            s.p95_ms,
-            s.interference * 100.0,
-        );
+        sample_and_print(samples);
         Ok(())
     }
 
@@ -574,12 +581,11 @@ notes:
 
     fn child_check(baseline: f64) -> Result<(), Fail> {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         let exe = std::env::current_exe().map_err(|e| Fail::Op(format!("current_exe: {e}")))?;
         let out = std::process::Command::new(exe)
             .args(["measure", "--samples", "200"])
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(nt::CREATE_NO_WINDOW)
             .output()
             .map_err(|e| Fail::Op(format!("spawn measure: {e}")))?;
         let text = String::from_utf8_lossy(&out.stdout);

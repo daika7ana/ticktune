@@ -227,20 +227,23 @@ pub const DENSE_SPAN_100NS: u32 = 500;
 /// Nothing above 1 ms is worth scanning: `Sleep(1)` already takes 2 ticks there.
 pub const MAX_USEFUL_100NS: u32 = 10_000;
 
-/// Coarse sweep from after the dense window up to `min(1 ms, coarsest)`.
-pub fn coarse_grid(finest: u32, coarsest: u32) -> Vec<u32> {
-    let lo = finest.saturating_add(DENSE_SPAN_100NS + COARSE_STEP_100NS);
-    let hi = coarsest.min(MAX_USEFUL_100NS);
+fn grid(lo: u32, hi: u32, step: u32) -> Vec<u32> {
     let mut v = Vec::new();
     let mut p = lo;
     while p <= hi {
         v.push(p);
-        match p.checked_add(COARSE_STEP_100NS) {
+        match p.checked_add(step) {
             Some(next) => p = next,
             None => break,
         }
     }
     v
+}
+
+/// Coarse sweep from after the dense window up to `min(1 ms, coarsest)`.
+pub fn coarse_grid(finest: u32, coarsest: u32) -> Vec<u32> {
+    let lo = finest.saturating_add(DENSE_SPAN_100NS + COARSE_STEP_100NS);
+    grid(lo, coarsest.min(MAX_USEFUL_100NS), COARSE_STEP_100NS)
 }
 
 /// Dense sweep where the tick knee lives, one unit at a time, starting at
@@ -251,16 +254,7 @@ pub fn dense_grid(finest: u32, coarsest: u32) -> Vec<u32> {
         .saturating_add(DENSE_SPAN_100NS)
         .min(coarsest)
         .min(MAX_USEFUL_100NS);
-    let mut v = Vec::new();
-    let mut p = finest;
-    while p <= hi {
-        v.push(p);
-        match p.checked_add(FINE_STEP_100NS) {
-            Some(next) => p = next,
-            None => break,
-        }
-    }
-    v
+    grid(finest, hi, FINE_STEP_100NS)
 }
 
 #[cfg(test)]

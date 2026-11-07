@@ -18,22 +18,14 @@ pub struct Logon {
 #[cfg(windows)]
 fn schtasks() -> Command {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut cmd = Command::new(schtasks_exe());
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut cmd = Command::new(crate::nt::system32("schtasks.exe"));
+    cmd.creation_flags(crate::nt::CREATE_NO_WINDOW);
     cmd
 }
 
 #[cfg(not(windows))]
 fn schtasks() -> Command {
-    Command::new(schtasks_exe())
-}
-
-fn schtasks_exe() -> String {
-    match std::env::var("SystemRoot") {
-        Ok(root) => format!("{root}\\System32\\schtasks.exe"),
-        Err(_) => "schtasks".to_string(),
-    }
+    Command::new("schtasks")
 }
 
 fn task_xml(exe: &str, period_100ns: u32) -> String {
@@ -122,19 +114,29 @@ pub fn start_startup() -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a task with our name exists, even if its arguments cannot be read.
+pub fn task_exists() -> bool {
+    schtasks()
+        .args(["/Query", "/TN", TASK_NAME])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Delete the task.
 pub fn remove_startup() -> Result<bool, String> {
-    let existed = logon_task().is_some();
-    if existed {
-        let out = schtasks()
-            .args(["/Delete", "/TN", TASK_NAME, "/F"])
-            .output()
-            .map_err(|e| format!("run schtasks: {e}"))?;
-        if !out.status.success() {
-            return Err(command_error("/Delete", &out));
-        }
+    if !task_exists() {
+        return Ok(false);
     }
-    Ok(existed)
+    let out = schtasks()
+        .args(["/Delete", "/TN", TASK_NAME, "/F"])
+        .output()
+        .map_err(|e| format!("run schtasks: {e}"))?;
+    if !out.status.success() {
+        return Err(command_error("/Delete", &out));
+    }
+    Ok(true)
 }
 
 /// The logon task's period and whether it still points at this exe.
@@ -274,6 +276,14 @@ mod tests {
                 .contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>")
         );
         assert!(task_xml("C:\\ticktune.exe", 5000).contains("<DisallowStartIfOnBatteries>false"));
+    }
+
+    #[test]
+    fn task_xml_pins_holder_replacement_and_privilege() {
+        let xml = task_xml("C:\\ticktune.exe", 5000);
+        assert!(xml.contains("<MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
     }
 
     #[test]
