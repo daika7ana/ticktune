@@ -6,7 +6,7 @@ mod stats;
 mod measure;
 #[cfg(windows)]
 mod nt;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod persist;
 #[cfg(windows)]
 mod scan;
@@ -22,6 +22,17 @@ mod cli {
     const USAGE: &str = "usage: timres query | bench [--samples N] [--prefer latency|power] | \
 apply (--resolution <100ns> | --ms <f64>) [--persist] [--no-console] | status | \
 measure [--samples N] | verify-global | global on|off | startup remove";
+
+    /// Samples per point in a bench run. 547 points at 500 samples is already
+    /// ~6 minutes; a larger number would look like a hang.
+    const MAX_BENCH_SAMPLES: usize = 500;
+
+    /// stdout may be a closed pipe (`timres bench | head`); a failed write must
+    /// not abort the scan.
+    fn out(args: std::fmt::Arguments<'_>) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), "{args}");
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -55,12 +66,6 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         Ok(n.min(100_000))
     }
 
-    /// Short-lived measurement paths: no power throttling, highest priority.
-    fn prepare_sampling() {
-        nt::ignore_timer_resolution_throttling();
-        nt::set_thread_priority(15);
-    }
-
     pub fn run() -> i32 {
         match dispatch() {
             Ok(()) => 0,
@@ -78,21 +83,35 @@ measure [--samples N] | verify-global | global on|off | startup remove";
 
     fn dispatch() -> Result<(), Fail> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        // `--help` works in any position, including after a subcommand.
+        if args.iter().any(|a| a == "--help" || a == "-h") {
+            println!("{USAGE}");
+            return Ok(());
+        }
         let cmd = match args.first() {
             Some(c) => c.as_str(),
             None => return Err(Fail::Usage("no subcommand".into())),
         };
         let rest = &args[1..];
         match cmd {
-            "query" => cmd_query(),
+            "query" => {
+                no_args("query", rest)?;
+                cmd_query()
+            }
             "bench" => cmd_bench(rest),
             "apply" => cmd_apply(rest),
-            "status" => cmd_status(),
+            "status" => {
+                no_args("status", rest)?;
+                cmd_status()
+            }
             "measure" => cmd_measure(rest),
-            "verify-global" => cmd_verify_global(),
+            "verify-global" => {
+                no_args("verify-global", rest)?;
+                cmd_verify_global()
+            }
             "global" => cmd_global(rest),
             "startup" => cmd_startup(rest),
-            "help" | "--help" | "-h" => {
+            "help" => {
                 println!("{USAGE}");
                 Ok(())
             }
@@ -100,12 +119,21 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         }
     }
 
-    fn cmd_query() -> Result<(), Fail> {
-        let range = nt::query().map_err(Fail::Op)?;
-        print_query_block(&range)
+    fn no_args(name: &str, rest: &[String]) -> Result<(), Fail> {
+        match rest.first() {
+            Some(a) => Err(Fail::Usage(format!("{name} takes no arguments (got {a})"))),
+            None => Ok(()),
+        }
     }
 
-    fn print_query_block(range: &nt::Range) -> Result<(), Fail> {
+    fn cmd_query() -> Result<(), Fail> {
+        let range = nt::query().map_err(Fail::Op)?;
+        print_query_block(&range);
+        Ok(())
+    }
+
+    fn print_query_block(range: &nt::Range) {
+        let elevated = nt::is_elevated();
         println!(
             "{:<20}{} ms  ({} x 100ns)",
             "finest",
@@ -132,9 +160,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             }
             Some(false) => println!("{:<20}enabled", "dynamic tick"),
             // bcdedit omits the line when it was never set, which is the default.
-            None if nt::is_elevated() => {
-                println!("{:<20}unset (default: enabled)", "dynamic tick")
-            }
+            None if elevated => println!("{:<20}unset (default: enabled)", "dynamic tick"),
             None => println!("{:<20}unknown (run elevated to read)", "dynamic tick"),
         }
         let startup = match persist::startup_period() {
@@ -147,12 +173,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             None => "none".to_string(),
         };
         println!("{:<20}{}", "startup", startup);
-        println!(
-            "{:<20}{}",
-            "elevated",
-            if nt::is_elevated() { "yes" } else { "no" }
-        );
-        Ok(())
+        println!("{:<20}{}", "elevated", if elevated { "yes" } else { "no" });
     }
 
     fn cmd_bench(args: &[String]) -> Result<(), Fail> {
@@ -183,7 +204,13 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         }
 
         let (coarse, fine) = match samples {
-            Some(n) => (n.min(1000), n),
+            Some(n) if n > MAX_BENCH_SAMPLES => {
+                out(format_args!(
+                    "note: bench caps --samples at {MAX_BENCH_SAMPLES} so a run stays under ~6 minutes"
+                ));
+                (MAX_BENCH_SAMPLES, MAX_BENCH_SAMPLES)
+            }
+            Some(n) => (n, n),
             None => (200, 200),
         };
         let report = scan::run(&scan::Options {
@@ -193,37 +220,31 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         })
         .map_err(Fail::Op)?;
 
-        println!(
+        out(format_args!(
             "range: {} - {} ms, global tick {} ms",
             fmt_period(report.range.finest),
             fmt_period(report.range.coarsest),
             fmt_period(report.range.current),
-        );
-        println!("{:<8} {:>8} {:>8} {:>7}", "request", "p50", "p95", "interf");
-        // The dense pass re-measures coarse points; print each request once,
-        // keeping the later (more sampled) row.
-        let mut seen = std::collections::HashSet::new();
-        let rows: Vec<_> = report
-            .points
-            .iter()
-            .rev()
-            .filter(|p| seen.insert(p.period_100ns))
-            .collect();
-        for p in rows.into_iter().rev() {
-            println!(
+        ));
+        out(format_args!(
+            "{:<8} {:>8} {:>8} {:>7}",
+            "request", "p50", "p95", "interf"
+        ));
+        for p in &report.points {
+            out(format_args!(
                 "{:<8} {:>8.3} {:>8.3} {:>6.1}%",
                 fmt_period(p.period_100ns),
                 p.p50_ms,
                 p.p95_ms,
                 p.interference * 100.0,
-            );
+            ));
         }
 
         let chosen = match report.chosen {
             Some(c) => c,
             None => {
                 return Err(Fail::Op(
-                    "no candidate was usable (interference too high)".into(),
+                    "no point met the usability thresholds (interference or latency)".into(),
                 ))
             }
         };
@@ -237,7 +258,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         } else {
             "[unstable: rerun]"
         };
-        println!(
+        out(format_args!(
             "{} {} ms  ({} x 100ns)  min={:.3} p50={:.3} p95={:.3} max={:.3} {}",
             label,
             fmt_period(chosen.period_100ns),
@@ -247,7 +268,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             chosen.p95_ms,
             chosen.max_ms,
             stability,
-        );
+        ));
         Ok(())
     }
 
@@ -308,7 +329,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             }
         }
 
-        prepare_sampling();
+        nt::prepare_sampling();
         nt::set(period).map_err(Fail::Op)?;
         println!("requesting {} ms", fmt_period(period));
         if persist {
@@ -329,9 +350,9 @@ measure [--samples N] | verify-global | global on|off | startup remove";
 
     fn cmd_status() -> Result<(), Fail> {
         let range = nt::query().map_err(Fail::Op)?;
-        prepare_sampling();
+        nt::prepare_sampling();
         let mut v = measure::sample_sleep(1000);
-        let s = Stats::from_samples(range.current, &mut v);
+        let s = Stats::from_samples(0, &mut v);
         println!("effective (this process)");
         println!(
             "p50={:.3} p95={:.3} interference={:.1}%",
@@ -342,7 +363,8 @@ measure [--samples N] | verify-global | global on|off | startup remove";
         if nt::global_requests_enabled() == Some(1) {
             println!("note: global timer requests are enabled; this value also applies to other processes");
         }
-        print_query_block(&range)
+        print_query_block(&range);
+        Ok(())
     }
 
     fn cmd_measure(args: &[String]) -> Result<(), Fail> {
@@ -359,10 +381,9 @@ measure [--samples N] | verify-global | global on|off | startup remove";
             i += 1;
         }
 
-        let range = nt::query().map_err(Fail::Op)?;
-        prepare_sampling();
+        nt::prepare_sampling();
         let mut v = measure::sample_sleep(samples);
-        let s = Stats::from_samples(range.current, &mut v);
+        let s = Stats::from_samples(0, &mut v);
         println!(
             "p50={:.3} p95={:.3} interference={:.1}%",
             s.p50_ms,
@@ -373,7 +394,7 @@ measure [--samples N] | verify-global | global on|off | startup remove";
     }
 
     fn cmd_verify_global() -> Result<(), Fail> {
-        prepare_sampling();
+        nt::prepare_sampling();
         let mut v = measure::sample_sleep(500);
         let base = Stats::from_samples(0, &mut v);
         println!("baseline p50={:.3} ms", base.p50_ms);
@@ -465,4 +486,5 @@ fn main() {
 #[cfg(not(windows))]
 fn main() {
     eprintln!("timres only runs on Windows. `cargo test` exercises the pure logic.");
+    std::process::exit(1);
 }

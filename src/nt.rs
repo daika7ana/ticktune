@@ -203,6 +203,16 @@ pub fn set_thread_priority(priority: i32) {
     }
 }
 
+/// `THREAD_PRIORITY_TIME_CRITICAL`.
+const TIME_CRITICAL: i32 = 15;
+
+/// Opt out of power throttling and raise this thread for measurement. Best
+/// effort; callers that outlive the measurement restore the priority.
+pub fn prepare_sampling() {
+    ignore_timer_resolution_throttling();
+    set_thread_priority(TIME_CRITICAL);
+}
+
 /// `GlobalTimerResolutionRequests` DWORD, if the key exists.
 pub fn global_requests_enabled() -> Option<u32> {
     let subkey = wide(KERNEL_KEY);

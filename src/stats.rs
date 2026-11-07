@@ -15,8 +15,6 @@ pub enum Prefer {
 pub struct Stats {
     /// The requested period, in 100 ns units.
     pub period_100ns: u32,
-    /// Number of samples kept (warmup already discarded by the sampler).
-    pub n: usize,
     pub min_ms: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
@@ -26,6 +24,11 @@ pub struct Stats {
     pub interference: f64,
 }
 
+/// A sample counts as interference when it overshoots p50 by this much. A
+/// relative `4 x p50` bar would be 4 ms on a 1 ms row, hiding exactly the
+/// 2-3 ms stalls worth reporting, and 2 ms on a 0.5 ms row.
+const INTERFERENCE_MARGIN_MS: f64 = 1.0;
+
 impl Stats {
     /// `samples` are slept durations in milliseconds; the slice is sorted in place.
     pub fn from_samples(period_100ns: u32, samples: &mut [f64]) -> Stats {
@@ -34,7 +37,6 @@ impl Stats {
         if n == 0 {
             return Stats {
                 period_100ns,
-                n: 0,
                 min_ms: 0.0,
                 p50_ms: 0.0,
                 p95_ms: 0.0,
@@ -52,13 +54,12 @@ impl Stats {
         let interference = if p50_ms <= 0.0 {
             0.0
         } else {
-            let limit = 4.0 * p50_ms;
+            let limit = p50_ms + INTERFERENCE_MARGIN_MS;
             samples.iter().filter(|&&s| s > limit).count() as f64 / n as f64
         };
 
         Stats {
             period_100ns,
-            n,
             min_ms: samples[0],
             p50_ms,
             p95_ms: pct(0.95),
@@ -77,7 +78,7 @@ impl Stats {
     /// The coarse pass only takes 200 samples, so 1 % would mean two hiccups
     /// reject the point; 2 % still catches a genuinely noisy run.
     pub fn usable(&self) -> bool {
-        self.n > 0 && self.interference <= 0.02 && self.p50_ms >= 0.99 && self.p95_ms <= 2.5
+        self.interference <= 0.02 && self.p50_ms >= 0.99 && self.p95_ms <= 2.5
     }
 
     /// Inside the latency budget, i.e. a candidate for `Prefer::Power`.
@@ -162,20 +163,22 @@ pub fn ms(period_100ns: u32) -> f64 {
 
 /// Coarse scan step: 10 us.
 pub const COARSE_STEP_100NS: u32 = 100;
-/// Fine scan step: one representable timer unit (100 ns). The knee where
+/// Dense scan step: one representable timer unit (100 ns). The knee where
 /// `Sleep(1)` drops from three ticks to two is under 1 us wide on recent
 /// builds, so a coarser step can walk straight over it.
 pub const FINE_STEP_100NS: u32 = 1;
+/// How far above `finest` the dense sweep reaches: 50 us. Every knee measured
+/// so far sits 2-11 us above `finest`, but there is no API for it, so this is
+/// a fixed window rather than one anchored on a coarse winner: outside the
+/// knee every coarse row measures the same, so that winner is noise.
+pub const DENSE_SPAN_100NS: u32 = 500;
 /// Nothing above 1 ms is worth scanning: `Sleep(1)` already takes 2 ticks there.
 pub const MAX_USEFUL_100NS: u32 = 10_000;
 
-/// Coarse sweep from `finest` up to `min(1 ms, coarsest)`, aligned to the step.
+/// Coarse sweep from after the dense window up to `min(1 ms, coarsest)`.
 pub fn coarse_grid(finest: u32, coarsest: u32) -> Vec<u32> {
-    let lo = finest;
+    let lo = finest.saturating_add(DENSE_SPAN_100NS + COARSE_STEP_100NS);
     let hi = coarsest.min(MAX_USEFUL_100NS);
-    if hi <= lo {
-        return vec![lo];
-    }
     let mut v = Vec::new();
     let mut p = lo;
     while p <= hi {
@@ -188,23 +191,16 @@ pub fn coarse_grid(finest: u32, coarsest: u32) -> Vec<u32> {
     v
 }
 
-/// Dense sweep around the coarse winner, where the tick boundary lives.
-///
-/// The coarse grid steps by 10 us, so the knee is within 10 us of `best` on
-/// either side: the winner can sit at the very bottom of the range, where a
-/// downward-only sweep would collapse to a single point. Stepping one unit at a
-/// time makes the search exhaustive over every value the kernel can be asked for.
-pub fn fine_grid(best: u32, finest: u32, coarsest: u32) -> Vec<u32> {
-    let hi = best
-        .saturating_add(COARSE_STEP_100NS)
+/// Dense sweep where the tick knee lives, one unit at a time, starting at
+/// `finest`. Exhaustive over the window, so no value the kernel accepts is
+/// skipped and the result does not depend on a noisy coarse ranking.
+pub fn dense_grid(finest: u32, coarsest: u32) -> Vec<u32> {
+    let hi = finest
+        .saturating_add(DENSE_SPAN_100NS)
         .min(coarsest)
         .min(MAX_USEFUL_100NS);
-    let lo = best.saturating_sub(COARSE_STEP_100NS).max(finest);
-    if lo > hi {
-        return vec![best];
-    }
     let mut v = Vec::new();
-    let mut p = lo;
+    let mut p = finest;
     while p <= hi {
         v.push(p);
         match p.checked_add(FINE_STEP_100NS) {
@@ -227,7 +223,6 @@ mod tests {
     fn stat(period_100ns: u32, p50: f64, p95: f64, interference: f64) -> Stats {
         Stats {
             period_100ns,
-            n: 100,
             min_ms: p50,
             p50_ms: p50,
             p95_ms: p95,
@@ -240,7 +235,6 @@ mod tests {
     fn percentiles_nearest_rank() {
         let mut s: Vec<f64> = (1..=11).map(|v| v as f64).collect();
         let st = Stats::from_samples(5000, &mut s);
-        assert_eq!(st.n, 11);
         assert_eq!(st.min_ms, 1.0);
         assert_eq!(st.max_ms, 11.0);
         assert_eq!(st.p50_ms, 6.0);
@@ -250,11 +244,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_tick_counting() {
+    fn empty_input_is_zero() {
         let mut empty: [f64; 0] = [];
         let e = Stats::from_samples(5120, &mut empty);
-        assert_eq!(e.n, 0);
         assert_eq!(e.p50_ms, 0.0);
+        assert!(!e.usable());
 
         // A period of 0 must not be used as a divisor anywhere.
         let mut c = [1.5];
@@ -274,6 +268,15 @@ mod tests {
         // Non-outlier spread contributes nothing.
         let mut clean = vec![1.0, 1.1, 1.2, 1.3, 1.4];
         assert_eq!(Stats::from_samples(5000, &mut clean).interference, 0.0);
+
+        // An absolute margin, so a one-tick tail on a 1 ms row is not
+        // interference while a 2.5 ms stall is.
+        let mut tail = vec![1.017; 19];
+        tail.push(1.5);
+        assert_eq!(Stats::from_samples(5114, &mut tail).interference, 0.0);
+        tail[19] = 2.5;
+        let st = Stats::from_samples(5114, &mut tail);
+        assert!(approx(st.interference, 1.0 / 20.0, 1e-12));
     }
 
     #[test]
@@ -318,50 +321,44 @@ mod tests {
     }
 
     #[test]
-    fn grids_clamp_and_keep_promised_endpoints() {
+    fn dense_window_covers_the_lower_band() {
+        let d = dense_grid(5000, 20_000);
+        assert_eq!(d.len(), 501);
+        assert_eq!(d.first(), Some(&5000));
+        assert_eq!(d.last(), Some(&5500));
+        assert!(d.windows(2).all(|w| w[1] - w[0] == FINE_STEP_100NS));
+
+        // Clamped at the useful maximum on a machine with a high floor.
+        let top = dense_grid(9800, 20_000);
+        assert_eq!(top.last(), Some(&MAX_USEFUL_100NS));
+        assert_eq!(top.len(), 201);
+
+        // Floor above the useful maximum: nothing to sweep.
+        assert!(dense_grid(20_000, 156_250).is_empty());
+    }
+
+    #[test]
+    fn coarse_grid_starts_after_the_dense_window() {
         let c = coarse_grid(5000, 20_000);
-        assert_eq!(c.first(), Some(&5000));
+        assert_eq!(c.first(), Some(&5600));
         assert_eq!(c.last(), Some(&10_000)); // 10_000 lands on the step
-        assert!(c.iter().all(|&p| (5000..=10_000).contains(&p)));
         assert!(c.windows(2).all(|w| w[1] - w[0] == COARSE_STEP_100NS));
 
         let off_step = coarse_grid(5000, 7250);
-        assert_eq!(off_step.first(), Some(&5000));
         assert_eq!(off_step.last(), Some(&7200)); // hi not included
         assert!(!off_step.contains(&7250));
 
-        // hi <= lo collapses to a single point.
-        assert_eq!(coarse_grid(20_000, 10_000), vec![20_000]);
-
-        let f = fine_grid(5100, 5000, 20_000);
-        assert!(f.contains(&5100));
-        assert!(f.iter().all(|&p| (5000..=10_000).contains(&p)));
-        assert!(f.windows(2).all(|w| w[1] - w[0] == FINE_STEP_100NS));
-        assert_eq!(f.first(), Some(&5000)); // best - span clamped to finest
-        assert_eq!(f.last(), Some(&5200)); // the knee can be above the winner
-
-        let clamped = fine_grid(9900, 5000, 20_000);
-        assert!(clamped.contains(&9900));
-        assert!(clamped.iter().all(|&p| p <= MAX_USEFUL_100NS));
-        assert_eq!(clamped.last(), Some(&MAX_USEFUL_100NS));
-
-        // lo > hi -> only best.
-        assert_eq!(fine_grid(100, 500, 600), vec![100]);
+        // No room left between the dense window and the ceiling.
+        assert!(coarse_grid(5000, 5500).is_empty());
     }
 
     #[test]
     fn dense_grid_covers_the_tick_knee() {
-        // Builds 26200/26300 put the 3-tick -> 2-tick knee around 5018-5025.
-        let f = fine_grid(5100, 5000, 20_000);
-        assert_eq!(f.len(), 201);
-        assert!(f.contains(&5018) && f.contains(&5023));
-
-        // A coarse winner at the very bottom of the range still sweeps upward,
-        // which is where the knee is when 0.5000 ms is on the slow side.
-        let floor = fine_grid(5000, 5000, 20_000);
-        assert_eq!(floor.len(), 101);
-        assert_eq!(floor.first(), Some(&5000));
-        assert!(floor.contains(&5018) && floor.contains(&5100));
+        // Builds 26200/26300 put the knee 18-25 units above the floor; the
+        // machine measured here put it at 5106-5132.
+        let d = dense_grid(5000, 20_000);
+        assert!(d.contains(&5018) && d.contains(&5023));
+        assert!(d.contains(&5106) && d.contains(&5132));
     }
 
     #[test]

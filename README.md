@@ -19,8 +19,8 @@ Single static executable. No dependencies, no driver, no service.
 
 - **Measures, does not assume.** Every candidate is timed with `Sleep(1)` on
   `QueryPerformanceCounter`, and the scan reports the distribution, not one number.
-- **Finds the real knee.** A 100 ns sweep around the coarse winner catches the
-  narrow fast band that a coarser step can walk straight past.
+- **Finds the real knee.** A fixed 100 ns sweep over the first 50 µs above the
+  floor catches the narrow fast band that a coarse step can walk straight past.
 - **Latency or power.** `--prefer latency` minimises p50/p95; `--prefer power` takes
   the coarsest period that still meets the latency budget.
 - **Two modes.** Per-process by default (no admin needed); machine-wide only after
@@ -69,12 +69,12 @@ period without input — see the **Before you benchmark** note below.
 timres bench
 ```
 
-The scan takes roughly 40 seconds. It prints one row per tested period
-(p50, p95, max, interference) and a final recommendation. `[stable]` means a re-check
+The scan takes two to three minutes. It prints one row per tested period
+(p50, p95, interference) and a final recommendation. `[stable]` means a re-check
 of the winner agreed with the first pass; `[unstable]` means the machine was noisy —
-rerun when it is quieter. For a tighter estimate use `--samples 1000` (slower), and
-`--prefer power` if you would rather have the coarsest period inside the latency
-budget.
+rerun when it is quieter. `--samples 100` gives a quicker, noisier answer; values
+above 500 are capped. Use `--prefer power` if you would rather have the coarsest
+period inside the latency budget.
 
 ### 5. Try the value
 
@@ -92,7 +92,8 @@ cleanup, no leftover state.
 timres apply --resolution 5120 --persist --no-console
 ```
 
-This writes a small `.cmd` to the Startup folder that starts the holder at logon.
+This writes a small `.vbs` to the Startup folder that starts the holder at logon
+with no console window.
 It is refused unless `GlobalTimerResolutionRequests` is `1`, because in per-process
 mode the holder would only accelerate itself. Check it after the next logon with
 `timres status`.
@@ -163,7 +164,14 @@ Set `DisableUserPresenceQos` (REG_DWORD `1`) under
 
 ## 🔨 Build
 
-Cross-compiles from Linux; no MSVC, no runtime DLLs.
+On Windows, a normal release build is enough (MSVC or GNU toolchain):
+
+```sh
+cargo build --release
+# target\release\timres.exe
+```
+
+From Linux, cross-compile; no MSVC, no runtime DLLs:
 
 ```sh
 rustup target add x86_64-pc-windows-gnu
@@ -177,12 +185,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 |---|---|
 | `src/stats.rs` | pure statistics, grids, recommendation — unit-tested on any OS |
 | `src/measure.rs` | `Sleep(1)` sampler on QPC |
-| `src/scan.rs` | coarse → fine → stability re-check |
+| `src/scan.rs` | dense low band, coarse sweep, stability re-check |
 | `src/nt.rs` | `NtSetTimerResolution` / `NtQueryTimerResolution`, registry, BCD probe |
-| `src/persist.rs` | logon `.cmd` in the Startup folder |
+| `src/persist.rs` | logon `.vbs` in the Startup folder |
 | `src/main.rs` | CLI |
-
-See `PLAN.md` for the measurement model and the evidence behind it.
 
 ## License
 

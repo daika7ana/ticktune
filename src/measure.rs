@@ -38,7 +38,7 @@ pub fn qpc_now_ms() -> f64 {
 
 /// Run `samples + WARMUP` sleeps and return the recorded durations in ms.
 ///
-/// The caller is responsible for priority and affinity (see `nt`). Interference
+/// The caller is responsible for priority (see `nt`). Interference
 /// is left in the data on purpose; `Stats` classifies it.
 pub fn sample_sleep(samples: usize) -> Vec<f64> {
     if samples == 0 {
