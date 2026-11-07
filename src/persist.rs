@@ -10,8 +10,9 @@ pub const TASK_NAME: &str = "ticktune";
 /// What the logon task currently runs.
 pub struct Logon {
     pub period_100ns: u32,
-    /// The task points at a different exe than this one, e.g. after a rebuild
-    /// elsewhere. It would start at logon and quietly do nothing useful.
+    /// The task no longer matches this build: it points at another exe, or it
+    /// was registered with a principal that still flashes a console (pre-S4U).
+    /// Re-running `--persist` fixes both.
     pub stale: bool,
 }
 
@@ -28,11 +29,16 @@ fn schtasks() -> Command {
     Command::new("schtasks")
 }
 
-fn task_xml(exe: &str, period_100ns: u32) -> String {
+fn task_xml(exe: &str, period_100ns: u32, user: &str) -> String {
     // A logon task with no execution time limit (the holder blocks forever),
     // allowed on battery, and run as the invoking user without elevation.
     // StopExisting: re-running `apply --persist` must replace a live holder,
     // not have its `/Run` dropped while the old period keeps winning.
+    //
+    // S4U runs the console-subsystem holder on a non-interactive desktop, so
+    // Windows has no visible console to flash at logon; `InteractiveToken`
+    // would show one before `main` runs. It needs no stored password and is
+    // safe because `--persist` already requires global mode.
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
@@ -47,7 +53,8 @@ fn task_xml(exe: &str, period_100ns: u32) -> String {
   </Triggers>\r\n\
   <Principals>\r\n\
     <Principal id=\"Author\">\r\n\
-      <LogonType>InteractiveToken</LogonType>\r\n\
+      <UserId>{}</UserId>\r\n\
+      <LogonType>S4U</LogonType>\r\n\
       <RunLevel>LeastPrivilege</RunLevel>\r\n\
     </Principal>\r\n\
   </Principals>\r\n\
@@ -76,16 +83,31 @@ fn task_xml(exe: &str, period_100ns: u32) -> String {
     </Exec>\r\n\
   </Actions>\r\n\
 </Task>\r\n",
+        xml_escape(user),
         xml_escape(exe),
         period_100ns
     )
 }
 
+/// The account the task runs as. Unlike `InteractiveToken`, S4U does not infer
+/// the principal from the registering user, so it must be named.
+fn current_user() -> Result<String, String> {
+    let user = std::env::var("USERNAME").map_err(|_| "USERNAME is not set".to_string())?;
+    match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.is_empty() => Ok(format!("{domain}\\{user}")),
+        _ => Ok(user),
+    }
+}
+
 /// Register the logon task. Replaces an existing one.
 pub fn install_startup(period_100ns: u32) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let user = current_user()?;
     let path = std::env::temp_dir().join(format!("ticktune-task-{}.xml", std::process::id()));
-    write_utf16(&path, &task_xml(&exe.display().to_string(), period_100ns))?;
+    write_utf16(
+        &path,
+        &task_xml(&exe.display().to_string(), period_100ns, &user),
+    )?;
 
     let out = schtasks()
         .args(["/Create", "/TN", TASK_NAME, "/XML"])
@@ -129,6 +151,9 @@ pub fn remove_startup() -> Result<bool, String> {
     if !task_exists() {
         return Ok(false);
     }
+    // S4U holders are not tied to the interactive session, so deleting the task
+    // alone would leave the request raised until reboot.
+    let _ = schtasks().args(["/End", "/TN", TASK_NAME]).output();
     let out = schtasks()
         .args(["/Delete", "/TN", TASK_NAME, "/F"])
         .output()
@@ -139,7 +164,7 @@ pub fn remove_startup() -> Result<bool, String> {
     Ok(true)
 }
 
-/// The logon task's period and whether it still points at this exe.
+/// The logon task's period and whether it still matches this build.
 pub fn logon_task() -> Option<Logon> {
     let out = schtasks()
         .args(["/Query", "/TN", TASK_NAME, "/XML"])
@@ -156,7 +181,7 @@ pub fn logon_task() -> Option<Logon> {
             .trim()
             .eq_ignore_ascii_case(&exe.display().to_string()),
         _ => false,
-    };
+    } || !xml.contains("<LogonType>S4U</LogonType>");
     Some(Logon {
         period_100ns,
         stale,
@@ -250,7 +275,11 @@ mod tests {
 
     #[test]
     fn task_xml_round_trips_command_and_period() {
-        let xml = task_xml("C:\\Program Files\\tim & tune\\ticktune.exe", 5119);
+        let xml = task_xml(
+            "C:\\Program Files\\tim & tune\\ticktune.exe",
+            5119,
+            "DESKTOP\\me",
+        );
         assert_eq!(
             extract_tag(&xml, "Command").as_deref(),
             Some("C:\\Program Files\\tim & tune\\ticktune.exe")
@@ -263,7 +292,7 @@ mod tests {
     fn logon_task_does_not_poll_esc() {
         // ESC is read desktop-wide; without --no-esc any window's ESC would
         // end the holder.
-        let xml = task_xml("C:\\ticktune.exe", 5000);
+        let xml = task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me");
         let args = extract_tag(&xml, "Arguments").unwrap();
         assert!(args.contains("--no-esc"), "arguments were: {args}");
     }
@@ -272,18 +301,31 @@ mod tests {
     fn task_does_not_get_a_default_time_limit() {
         // The holder blocks forever; the default 72 h limit would kill it.
         assert!(
-            task_xml("C:\\ticktune.exe", 5000)
+            task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me")
                 .contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>")
         );
-        assert!(task_xml("C:\\ticktune.exe", 5000).contains("<DisallowStartIfOnBatteries>false"));
+        assert!(
+            task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me")
+                .contains("<DisallowStartIfOnBatteries>false")
+        );
     }
 
     #[test]
     fn task_xml_pins_holder_replacement_and_privilege() {
-        let xml = task_xml("C:\\ticktune.exe", 5000);
+        let xml = task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me");
         assert!(xml.contains("<MultipleInstancesPolicy>StopExisting</MultipleInstancesPolicy>"));
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
-        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<UserId>DESKTOP\\me</UserId>"));
+    }
+
+    #[test]
+    fn task_runs_on_a_non_interactive_desktop() {
+        // InteractiveToken makes Windows show the console of a
+        // console-subsystem image before `main` runs; S4U runs it on a
+        // non-interactive desktop, so there is no window to flash.
+        let xml = task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me");
+        assert!(xml.contains("<LogonType>S4U</LogonType>"));
+        assert!(!xml.contains("InteractiveToken"));
     }
 
     #[test]

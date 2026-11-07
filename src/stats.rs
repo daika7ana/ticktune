@@ -187,19 +187,16 @@ pub enum Verdict {
     Inconclusive,
 }
 
-/// Baseline at or below this is already as fast as the request we made, so the
-/// child cannot tell the modes apart. A 1 ms tick still sleeps ~2 ms, so even
-/// the slowest "already fine" baseline stays under this.
-const BASELINE_ALREADY_FAST_MS: f64 = 1.5;
-
 /// Compare a no-request baseline against a child process measured while this
 /// process held the finest request.
 ///
-/// The ratio is the discriminator, not an absolute cutoff: a machine whose
-/// ambient tick is 1 ms measures ~2 ms either way, so only a child that is
-/// clearly faster than the baseline proves the request crossed into it.
-pub fn classify_global(baseline_ms: f64, child_ms: f64) -> Verdict {
-    if baseline_ms <= BASELINE_ALREADY_FAST_MS {
+/// `coarsest_ms` is the platform's no-request tick. A baseline far below it
+/// means the machine already holds a fine request, so the child's sleep cannot
+/// be attributed to this process. Otherwise the ratio is the discriminator: a
+/// child that is clearly faster than the baseline proves the request crossed
+/// into it.
+pub fn classify_global(baseline_ms: f64, child_ms: f64, coarsest_ms: f64) -> Verdict {
+    if baseline_ms < coarsest_ms * 0.75 {
         Verdict::Inconclusive
     } else if child_ms <= baseline_ms * 0.75 {
         Verdict::Global
@@ -423,15 +420,18 @@ mod tests {
 
     #[test]
     fn global_verdict_is_relative_to_the_baseline() {
-        assert_eq!(classify_global(15.6, 1.0), Verdict::Global);
-        assert_eq!(classify_global(15.6, 15.6), Verdict::PerProcess);
-        // A 1 ms ambient tick sleeps ~2 ms; a child that stays there did not
-        // see the request, so this is a per-process answer, not ambiguity.
-        assert_eq!(classify_global(2.0, 2.0), Verdict::PerProcess);
-        assert_eq!(classify_global(2.0, 1.0), Verdict::Global);
-        // Already as fast as the request: the child cannot discriminate.
-        assert_eq!(classify_global(1.0, 1.0), Verdict::Inconclusive);
-        assert_eq!(classify_global(1.5, 1.5), Verdict::Inconclusive);
+        assert_eq!(classify_global(15.6, 1.0, 15.625), Verdict::Global);
+        assert_eq!(classify_global(15.6, 15.6, 15.625), Verdict::PerProcess);
+        // Below the platform tick something already holds a fine request, so
+        // the child's sleep says nothing about this process's request.
+        assert_eq!(classify_global(2.0, 2.0, 15.625), Verdict::Inconclusive);
+        assert_eq!(classify_global(2.0, 1.0, 15.625), Verdict::Inconclusive);
+        assert_eq!(classify_global(1.0, 1.0, 15.625), Verdict::Inconclusive);
+        assert_eq!(classify_global(1.5, 1.5, 15.625), Verdict::Inconclusive);
+        // 0.5116 ms tick: Sleep(1) lands on 2 or 3 ticks, and 3 ticks is
+        // 1.518 ms - a baseline that used to slip past the 1.5 ms guard and
+        // produce a confident, wrong "per-process".
+        assert_eq!(classify_global(1.518, 1.505, 15.625), Verdict::Inconclusive);
     }
 
     #[test]
@@ -477,10 +477,10 @@ mod tests {
 
     #[test]
     fn global_verdict_has_three_outcomes() {
-        assert_eq!(classify_global(15.6, 1.02), Verdict::Global);
-        assert_eq!(classify_global(15.6, 1.43), Verdict::Global);
-        assert_eq!(classify_global(15.6, 15.5), Verdict::PerProcess);
+        assert_eq!(classify_global(15.6, 1.02, 15.625), Verdict::Global);
+        assert_eq!(classify_global(15.6, 1.43, 15.625), Verdict::Global);
+        assert_eq!(classify_global(15.6, 15.5, 15.625), Verdict::PerProcess);
         // Something already holds a fine request: no conclusion possible.
-        assert_eq!(classify_global(1.02, 1.02), Verdict::Inconclusive);
+        assert_eq!(classify_global(1.02, 1.02, 15.625), Verdict::Inconclusive);
     }
 }

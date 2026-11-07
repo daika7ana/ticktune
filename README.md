@@ -63,6 +63,10 @@ ticktune global on
 ticktune verify-global
 ```
 
+`verify-global` needs the timer at rest: if anything already holds a fine request
+(a browser, an audio app, or the logon holder from step 6), it reports
+`inconclusive` and names the tick. Stop that process and rerun.
+
 ### 3. Quiet the machine
 
 Close browsers, launchers, overlays, monitoring and RGB utilities. Some of them hold
@@ -139,18 +143,18 @@ ticktune apply --resolution 5120 --persist
 
 This registers a Task Scheduler task named `ticktune` that runs the holder 15 s
 after logon, starts it immediately, and returns — the task, not your shell, owns
-the request from then on. The task runs with least privilege, is allowed on
-battery, and has no execution time limit (a default task would stop it after 72
-hours). It is started with `--no-esc`, because ESC is read desktop-wide and
-would otherwise end the holder from any window; stop it from Task Scheduler
-instead. Open Task Scheduler to inspect or edit it, or delete it with
-`ticktune startup remove`.
-It is refused unless `GlobalTimerResolutionRequests` is `1`, because in per-process
-mode the holder would only accelerate itself. That check reads the registry value,
-not the running boot: reboot and run `ticktune verify-global` (step 2) before
-`--persist`. Check the task after the next logon with `ticktune status`. The task
-stores the exe path, so rebuild or move the binary and you must run `--persist`
-again — `query` marks the old one as `stale`.
+the request from then on. It runs as you, without elevation and without a
+console window. It is allowed on battery and never times out (the default 72 h
+limit would stop it). It is started with `--no-esc`, because ESC is read
+desktop-wide and would otherwise end the holder from any window; stop it from
+Task Scheduler instead. Delete it with `ticktune startup remove`, which also
+ends a running holder. `--persist` is refused unless
+`GlobalTimerResolutionRequests` is `1` (in per-process mode the holder would
+only accelerate itself); that check reads the registry value, not the running
+boot, so reboot and run `ticktune verify-global` (step 2) first. Check the task
+after the next logon with `ticktune status`. It stores the exe path, so re-run
+`--persist` after rebuilding, moving, or upgrading the binary — `query` marks
+an outdated task as `stale`.
 
 ### 7. Undo everything
 
@@ -159,7 +163,7 @@ ticktune startup remove    # delete the logon holder
 ticktune global off        # elevated; takes effect after a reboot
 ```
 
-Close any holder that is still running. No other state is left behind.
+Any holder that is still running is ended with the task. No other state is left behind.
 
 ## 📋 Commands
 

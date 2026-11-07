@@ -35,6 +35,8 @@ build.
   on `any(windows, test)` so its pure parsing tests run on Linux. Task presence
   is `task_exists()` (`/Query /TN`); `logon_task()` returns `None` when an
   edited task's arguments don't parse, so it is not an existence check.
+  `remove_startup()` ends a running instance before deleting it, because an S4U
+  holder outlives the interactive session.
 - `src/main.rs` — hand-rolled CLI dispatch (no clap); most of the file is the
   `cfg(windows)` `cli` module.
 
@@ -66,6 +68,11 @@ revive the old name.
 - The logon task XML behaviours are pinned by tests — preserve `--no-esc`
   (ESC is desktop-wide), `StopExisting`, `PT0S` execution limit, battery
   allowed, least privilege, and UTF-16 BOM decoding when editing `persist.rs`.
+- The task principal is `S4U` with the current user's `UserId`. That runs the
+  console-subsystem holder on a non-interactive desktop, so no console window
+  flashes at logon; `InteractiveToken` would show one before `main` runs. S4U
+  stores no password and needs the "Log on as a batch job" right (administrators
+  have it); it is only safe because `--persist` already requires global mode.
 - `apply` is a holder, not a sampler: it calls
   `ignore_timer_resolution_throttling()`, never `prepare_sampling()` (which
   also raises the thread to time-critical for the process lifetime).

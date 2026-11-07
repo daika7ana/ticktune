@@ -52,7 +52,7 @@ notes:
   apply needs exactly one of --resolution or --ms, within the platform range.
   apply --persist requires GlobalTimerResolutionRequests=1 (see verify-global).
   bench stops early on ESC; --samples 1000 takes about 13 minutes.
-  startup remove leaves a holder that is already running until logout.";
+  startup remove also ends a running holder.";
 
     /// Samples per point in a bench run. 547 points at 1000 samples is ~11
     /// minutes; a larger number would look like a hang.
@@ -213,7 +213,7 @@ notes:
         let startup = match persist::logon_task() {
             Some(task) => {
                 let stale = if task.stale {
-                    " (stale: task points at another exe)"
+                    " (stale: re-run apply --persist)"
                 } else {
                     ""
                 };
@@ -565,21 +565,42 @@ notes:
     }
 
     fn cmd_verify_global() -> Result<(), Fail> {
+        let range = nt::query().map_err(Fail::Op)?;
+        if range.current < range.coarsest {
+            // The test needs the no-request timer. Anything already holding a
+            // finer request - including the logon holder - makes a child's
+            // sleep unattributable, and a Sleep(1) baseline can land on either
+            // side of a fixed cutoff.
+            outln!(
+                "global: inconclusive - the tick is already {} ms, so something holds a fine request.",
+                fmt_period(range.current)
+            );
+            if persist::logon_task().is_some_and(|t| t.period_100ns == range.current) {
+                outln!(
+                    "the logon task holds it: run `ticktune startup remove`, verify, then `apply --persist` again."
+                );
+            } else {
+                outln!(
+                    "close it and rerun to get a real answer; `powercfg /energy` (elevated) names the process holding it."
+                );
+            }
+            return Ok(());
+        }
+
         nt::prepare_sampling();
         let mut v = measure::sample_sleep(500);
         let base = Stats::from_samples(0, &mut v);
         outln!("baseline p50={:.3} ms", base.p50_ms);
 
-        let range = nt::query().map_err(Fail::Op)?;
         nt::set(range.finest).map_err(Fail::Op)?;
 
-        let outcome = child_check(base.p50_ms);
+        let outcome = child_check(base.p50_ms, stats::ms(range.coarsest));
         let release = nt::release().map_err(Fail::Op);
         release?;
         outcome
     }
 
-    fn child_check(baseline: f64) -> Result<(), Fail> {
+    fn child_check(baseline: f64, coarsest: f64) -> Result<(), Fail> {
         use std::os::windows::process::CommandExt;
 
         let exe = std::env::current_exe().map_err(|e| Fail::Op(format!("current_exe: {e}")))?;
@@ -595,7 +616,7 @@ notes:
             .and_then(|v| v.parse::<f64>().ok())
             .ok_or_else(|| Fail::Op(format!("could not parse child output: {}", text.trim())))?;
 
-        match stats::classify_global(baseline, child) {
+        match stats::classify_global(baseline, child, coarsest) {
             Verdict::Global => outln!("global: yes - a child process saw the finer tick"),
             Verdict::PerProcess => {
                 outln!(
@@ -603,7 +624,11 @@ notes:
                     child,
                     baseline,
                 );
-                outln!("enabling requires GlobalTimerResolutionRequests=1 and a reboot.");
+                if nt::global_requests_enabled() == Some(1) {
+                    outln!("the registry flag is set but not in effect; reboot to apply it.");
+                } else {
+                    outln!("enabling requires GlobalTimerResolutionRequests=1 and a reboot.");
+                }
             }
             Verdict::Inconclusive => {
                 outln!(
@@ -643,9 +668,6 @@ notes:
                     "logon task: {}",
                     if removed { "removed" } else { "not installed" }
                 );
-                if removed {
-                    outln!("note: a holder started at logon keeps running until you log out.");
-                }
                 Ok(())
             }
             Some("remove") => Err(Fail::Usage("startup remove takes no arguments".into())),
