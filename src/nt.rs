@@ -231,7 +231,7 @@ const ERROR_ALREADY_EXISTS: u32 = 183;
 /// Claim the bench name for this process. Two benches share one tick, so each
 /// would measure the other's request instead of its own.
 pub fn bench_instance() -> Result<InstanceGuard, String> {
-    let name = wide("Local\\timres-bench");
+    let name = wide("Local\\ticktune-bench");
     let handle = unsafe { CreateMutexW(core::ptr::null_mut(), 0, name.as_ptr()) };
     if handle.is_null() {
         return Err("CreateMutexW failed".to_string());
@@ -240,7 +240,7 @@ pub fn bench_instance() -> Result<InstanceGuard, String> {
         unsafe {
             CloseHandle(handle);
         }
-        return Err("another timres bench is already running; wait for it to finish".to_string());
+        return Err("another ticktune bench is already running; wait for it to finish".to_string());
     }
     Ok(InstanceGuard(handle))
 }

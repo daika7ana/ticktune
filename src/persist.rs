@@ -2,14 +2,10 @@
 //! the holder. No COM — `schtasks.exe` is driven with an XML definition, so the
 //! task is visible and editable in Task Scheduler like any other.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-pub const TASK_NAME: &str = "timres";
-
-/// Kept only so a launcher left by an older build is removed instead of
-/// surviving `startup remove`.
-const LEGACY_SCRIPTS: [&str; 2] = ["timres.vbs", "timres.cmd"];
+pub const TASK_NAME: &str = "ticktune";
 
 /// What the logon task currently runs.
 pub struct Logon {
@@ -49,7 +45,7 @@ fn task_xml(exe: &str, period_100ns: u32) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
   <RegistrationInfo>\r\n\
-    <Description>Holds a Windows timer resolution request. Managed by timres.</Description>\r\n\
+    <Description>Holds a Windows timer resolution request. Managed by ticktune.</Description>\r\n\
   </RegistrationInfo>\r\n\
   <Triggers>\r\n\
     <LogonTrigger>\r\n\
@@ -96,7 +92,7 @@ fn task_xml(exe: &str, period_100ns: u32) -> String {
 /// Register the logon task. Replaces an existing one.
 pub fn install_startup(period_100ns: u32) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let path = std::env::temp_dir().join(format!("timres-task-{}.xml", std::process::id()));
+    let path = std::env::temp_dir().join(format!("ticktune-task-{}.xml", std::process::id()));
     write_utf16(&path, &task_xml(&exe.display().to_string(), period_100ns))?;
 
     let out = schtasks()
@@ -110,7 +106,6 @@ pub fn install_startup(period_100ns: u32) -> Result<(), String> {
     if !out.status.success() {
         return Err(command_error("/Create", &out));
     }
-    remove_legacy_scripts();
     Ok(())
 }
 
@@ -127,7 +122,7 @@ pub fn start_startup() -> Result<(), String> {
     Ok(())
 }
 
-/// Delete the task and any launcher left by an older build.
+/// Delete the task.
 pub fn remove_startup() -> Result<bool, String> {
     let existed = logon_task().is_some();
     if existed {
@@ -139,7 +134,7 @@ pub fn remove_startup() -> Result<bool, String> {
             return Err(command_error("/Delete", &out));
         }
     }
-    Ok(remove_legacy_scripts() || existed)
+    Ok(existed)
 }
 
 /// The logon task's period and whether it still points at this exe.
@@ -247,36 +242,16 @@ fn parse_period(arguments: &str) -> Option<u32> {
     None
 }
 
-fn remove_legacy_scripts() -> bool {
-    let Some(dir) = std::env::var("APPDATA").ok().map(|a| {
-        PathBuf::from(a)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs")
-            .join("Startup")
-    }) else {
-        return false;
-    };
-    let mut removed = false;
-    for name in LEGACY_SCRIPTS {
-        if std::fs::remove_file(dir.join(name)).is_ok() {
-            removed = true;
-        }
-    }
-    removed
-}
-
 #[cfg(test)]
 mod tests {
     use super::{decode, extract_tag, parse_period, task_xml};
 
     #[test]
     fn task_xml_round_trips_command_and_period() {
-        let xml = task_xml("C:\\Program Files\\tim & res\\timres.exe", 5119);
+        let xml = task_xml("C:\\Program Files\\tim & tune\\ticktune.exe", 5119);
         assert_eq!(
             extract_tag(&xml, "Command").as_deref(),
-            Some("C:\\Program Files\\tim & res\\timres.exe")
+            Some("C:\\Program Files\\tim & tune\\ticktune.exe")
         );
         let args = extract_tag(&xml, "Arguments").unwrap();
         assert_eq!(parse_period(&args), Some(5119));
@@ -286,7 +261,7 @@ mod tests {
     fn logon_task_does_not_poll_esc() {
         // ESC is read desktop-wide; without --no-esc any window's ESC would
         // end the holder.
-        let xml = task_xml("C:\\timres.exe", 5000);
+        let xml = task_xml("C:\\ticktune.exe", 5000);
         let args = extract_tag(&xml, "Arguments").unwrap();
         assert!(args.contains("--no-esc"), "arguments were: {args}");
     }
@@ -295,10 +270,10 @@ mod tests {
     fn task_does_not_get_a_default_time_limit() {
         // The holder blocks forever; the default 72 h limit would kill it.
         assert!(
-            task_xml("C:\\timres.exe", 5000)
+            task_xml("C:\\ticktune.exe", 5000)
                 .contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>")
         );
-        assert!(task_xml("C:\\timres.exe", 5000).contains("<DisallowStartIfOnBatteries>false"));
+        assert!(task_xml("C:\\ticktune.exe", 5000).contains("<DisallowStartIfOnBatteries>false"));
     }
 
     #[test]

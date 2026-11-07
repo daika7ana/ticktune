@@ -20,10 +20,10 @@ mod cli {
     use crate::stats::{self, Prefer, Stats, Verdict};
 
     /// One line for errors; `--help` prints the full table.
-    const USAGE: &str = "usage: timres <command> [options] (run `timres --help`)";
+    const USAGE: &str = "usage: ticktune <command> [options] (run `ticktune --help`)";
 
     const HELP: &str = "\
-usage: timres <command> [options]
+usage: ticktune <command> [options]
 
 commands:
   query                     show the timer range, mode, and current state
@@ -58,7 +58,7 @@ notes:
     /// minutes; a larger number would look like a hang.
     const MAX_BENCH_SAMPLES: usize = 1000;
 
-    /// stdout may be a closed pipe (`timres bench | head`); a failed write must
+    /// stdout may be a closed pipe (`ticktune bench | head`); a failed write must
     /// not abort the scan.
     fn out(args: std::fmt::Arguments<'_>) {
         use std::io::Write;
@@ -260,7 +260,7 @@ notes:
         };
         let report = scan::run(&scan::Options { samples, prefer }).map_err(Fail::Op)?;
 
-        out(format_args!("timres bench"));
+        out(format_args!("ticktune bench"));
         out(format_args!(""));
         out(format_args!(
             "  {:<12}{} - {} ms",
@@ -391,7 +391,7 @@ notes:
             ));
         }
         out(format_args!(
-            "  {:<12}timres apply --resolution {}",
+            "  {:<12}ticktune apply --resolution {}",
             "next step", chosen.period_100ns
         ));
         Ok(())
@@ -447,8 +447,10 @@ notes:
         }
 
         if nt::global_requests_enabled() != Some(1) {
-            eprintln!("warning: requests are per-process here, so this affects timres.exe only.");
-            eprintln!("         run `timres global on` (admin) and reboot for other applications.");
+            eprintln!("warning: requests are per-process here, so this affects ticktune.exe only.");
+            eprintln!(
+                "         run `ticktune global on` (admin) and reboot for other applications."
+            );
             if persist {
                 return Err(Fail::Usage(
                     "refusing --persist: the logon holder would only affect itself. Enable global mode and reboot first.".into(),
@@ -612,7 +614,7 @@ notes:
         let on = match args {
             [a] if a == "on" => true,
             [a] if a == "off" => false,
-            _ => return Err(Fail::Usage("expected: timres global on|off".into())),
+            _ => return Err(Fail::Usage("expected: ticktune global on|off".into())),
         };
         nt::set_global_requests(on).map_err(Fail::Op)?;
         outln!(
@@ -621,7 +623,7 @@ notes:
         );
         if on {
             outln!(
-                "The flag is read at boot, so `apply --persist` is only safe after the reboot and a passing `timres verify-global`."
+                "The flag is read at boot, so `apply --persist` is only safe after the reboot and a passing `ticktune verify-global`."
             );
         }
         Ok(())
@@ -641,7 +643,7 @@ notes:
                 Ok(())
             }
             Some("remove") => Err(Fail::Usage("startup remove takes no arguments".into())),
-            _ => Err(Fail::Usage("expected: timres startup remove".into())),
+            _ => Err(Fail::Usage("expected: ticktune startup remove".into())),
         }
     }
 }
@@ -653,6 +655,6 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("timres only runs on Windows. `cargo test` exercises the pure logic.");
+    eprintln!("ticktune only runs on Windows. `cargo test` exercises the pure logic.");
     std::process::exit(1);
 }

@@ -1,16 +1,18 @@
-# timres
+# TickTune
+
+Windows timer resolution, measured — not assumed.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)](https://github.com/daika7ana/win-timer-resolution)
+[![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)](https://github.com/daika7ana/ticktune)
 [![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen)](Cargo.toml)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
-[![CI](https://github.com/daika7ana/win-timer-resolution/actions/workflows/ci.yml/badge.svg)](https://github.com/daika7ana/win-timer-resolution/actions/workflows/ci.yml)
+[![CI](https://github.com/daika7ana/ticktune/actions/workflows/ci.yml/badge.svg)](https://github.com/daika7ana/ticktune/actions/workflows/ci.yml)
 
 Measure the timer resolution Windows actually delivers, then request the best one.
 
 Windows reports a nominal range, but the latency a process really sees is quantised
 and not monotonic: the nominal minimum is often slower than a slightly coarser
-request. `timres` sweeps the usable range, measures real `Sleep(1)` latency at each
+request. `ticktune` sweeps the usable range, measures real `Sleep(1)` latency at each
 step, and recommends the point with the lowest consistent latency — or the coarsest
 point that stays within a latency budget.
 
@@ -25,7 +27,7 @@ Single static executable. No dependencies, no driver, no service.
 - **Latency or power.** `--prefer latency` minimises p50/p95; `--prefer power` takes
   the coarsest period that still meets the latency budget.
 - **Two modes.** Per-process by default (no admin needed); machine-wide only after
-  an explicit `timres global on` and a reboot.
+  an explicit `ticktune global on` and a reboot.
 - **Nothing hidden.** The registry key and the dynamic-tick setting are reported,
   never toggled behind your back.
 
@@ -34,7 +36,7 @@ Single static executable. No dependencies, no driver, no service.
 ### 1. Look at what Windows reports
 
 ```sh
-timres query
+ticktune query
 ```
 
 This prints the finest and coarsest periods, the current global tick, the request
@@ -45,20 +47,20 @@ elevated. It changes nothing; without elevation the dynamic-tick line reads
 ### 2. Decide what you want to affect
 
 - **Per-process (default).** A timer request belongs to the process that makes it
-  and disappears when that process exits. It is **not inherited**: `timres apply`
-  therefore only affects `timres.exe` itself — not a child process, and not an
+  and disappears when that process exits. It is **not inherited**: `ticktune apply`
+  therefore only affects `ticktune.exe` itself — not a child process, and not an
   already-running game or browser.
-- **Machine-wide.** After `timres global on` (elevated) and a reboot, a request
+- **Machine-wide.** After `ticktune global on` (elevated) and a reboot, a request
   affects every process — but only while some process holds one. `global on` alone
   changes nothing, so keep a holder running: the logon task from step 6, or a
-  foreground `timres apply`. Confirm it with `timres verify-global` before relying
+  foreground `ticktune apply`. Confirm it with `ticktune verify-global` before relying
   on it.
 
 ```sh
 # elevated terminal
-timres global on
+ticktune global on
 # reboot, then
-timres verify-global
+ticktune verify-global
 ```
 
 ### 3. Quiet the machine
@@ -72,14 +74,14 @@ period without input — see the **Before you benchmark** note below.
 ### 4. Run the scan
 
 ```sh
-timres bench
+ticktune bench
 ```
 
 The scan takes two to three minutes and prints a report like this example (the
 plateau boundaries and point counts vary by machine):
 
 ```
-timres bench
+ticktune bench
 
   range       0.5000 - 15.6250 ms
   global tick 1.0000 ms
@@ -95,7 +97,7 @@ result
   latency     min 1.008   p50 1.017   p95 1.517   max 1.525 ms
   vs floor    p50 1.505 ms at 0.5000 ms  (32% lower)
   stability   stable (re-check agreed)
-  next step   timres apply --resolution 5119
+  next step   ticktune apply --resolution 5119
 ```
 
 The curve is collapsed into plateaus because 500+ identical rows are noise. Add
@@ -120,41 +122,41 @@ than this figure.
 ### 5. Try the value
 
 ```sh
-timres apply --resolution 5120
+ticktune apply --resolution 5120
 ```
 
-Keep the window open. The request belongs to this process alone, so `timres measure`
+Keep the window open. The request belongs to this process alone, so `ticktune measure`
 in another terminal does not see it; to observe the effect system-wide, enable
-global mode (§2) and use `timres verify-global`. Press ESC or Ctrl+C (or close the
+global mode (§2) and use `ticktune verify-global`. Press ESC or Ctrl+C (or close the
 window) to release it — no cleanup, no leftover state. With `--no-console` there is
 no Ctrl+C, so use ESC.
 
 ### 6. Keep it across reboots (optional, machine-wide only)
 
 ```sh
-timres apply --resolution 5120 --persist
+ticktune apply --resolution 5120 --persist
 ```
 
-This registers a Task Scheduler task named `timres` that runs the holder 15 s
+This registers a Task Scheduler task named `ticktune` that runs the holder 15 s
 after logon, starts it immediately, and returns — the task, not your shell, owns
 the request from then on. The task runs with least privilege, is allowed on
 battery, and has no execution time limit (a default task would stop it after 72
 hours). It is started with `--no-esc`, because ESC is read desktop-wide and
 would otherwise end the holder from any window; stop it from Task Scheduler
 instead. Open Task Scheduler to inspect or edit it, or delete it with
-`timres startup remove`.
+`ticktune startup remove`.
 It is refused unless `GlobalTimerResolutionRequests` is `1`, because in per-process
 mode the holder would only accelerate itself. That check reads the registry value,
-not the running boot: reboot and run `timres verify-global` (step 2) before
-`--persist`. Check the task after the next logon with `timres status`. The task
+not the running boot: reboot and run `ticktune verify-global` (step 2) before
+`--persist`. Check the task after the next logon with `ticktune status`. The task
 stores the exe path, so rebuild or move the binary and you must run `--persist`
 again — `query` marks the old one as `stale`.
 
 ### 7. Undo everything
 
 ```sh
-timres startup remove    # delete the logon holder
-timres global off        # elevated; takes effect after a reboot
+ticktune startup remove    # delete the logon holder
+ticktune global off        # elevated; takes effect after a reboot
 ```
 
 Close any holder that is still running. No other state is left behind.
@@ -163,16 +165,16 @@ Close any holder that is still running. No other state is left behind.
 
 | Command | What it does |
 |---|---|
-| `timres query` | Print the finest/coarsest periods, global tick, mode, dynamic-tick state and logon task |
-| `timres bench [--samples N] [--prefer latency\|power] [--rows]` | Scan and recommend |
-| `timres apply --resolution <100ns>` | Hold a period for this process; add `--persist` for the logon holder |
-| `timres apply --ms <float>` | Same, in milliseconds |
-| `timres status` | Sample this process, then print the `query` block |
-| `timres measure [--samples N]` | Sample only; sets nothing (default 1000, max 100000) |
-| `timres verify-global` | Check whether a request affects other processes |
-| `timres global on\|off` | Write the registry key (elevated, reboot required) |
-| `timres startup remove` | Delete the logon holder |
-| `timres help` | Print the built-in help (`-h`/`--help` works after any command) |
+| `ticktune query` | Print the finest/coarsest periods, global tick, mode, dynamic-tick state and logon task |
+| `ticktune bench [--samples N] [--prefer latency\|power] [--rows]` | Scan and recommend |
+| `ticktune apply --resolution <100ns>` | Hold a period for this process; add `--persist` for the logon holder |
+| `ticktune apply --ms <float>` | Same, in milliseconds |
+| `ticktune status` | Sample this process, then print the `query` block |
+| `ticktune measure [--samples N]` | Sample only; sets nothing (default 1000, max 100000) |
+| `ticktune verify-global` | Check whether a request affects other processes |
+| `ticktune global on\|off` | Write the registry key (elevated, reboot required) |
+| `ticktune startup remove` | Delete the logon holder |
+| `ticktune help` | Print the built-in help (`-h`/`--help` works after any command) |
 
 Values are in 100 ns units; the output always shows milliseconds too.
 
@@ -182,7 +184,7 @@ argument.
 
 ## 🤔 Why this is not "just set 0.5 ms"
 
-`timres` targets Windows 10 2004 (build 19041) and later, including Windows 11:
+`ticktune` targets Windows 10 2004 (build 19041) and later, including Windows 11:
 earlier builds do not have the per-process request model this tool assumes.
 
 Since Windows 10 2004 a timer-resolution request is **per-process**: it applies to
@@ -209,7 +211,7 @@ Windows 11 (2025+) can quietly drop a foreground app to "Medium" QoS after a per
 with no input, which skews an unattended run — Microsoft's own docs warn about it.
 Set `DisableUserPresenceQos` (REG_DWORD `1`) under
 `HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling` before benchmarking.
-`timres` never writes it.
+`ticktune` never writes it.
 
 ## 🛡️ What it deliberately does not do
 
@@ -218,7 +220,7 @@ Set `DisableUserPresenceQos` (REG_DWORD `1`) under
   reboot to undo. `query`/`status` report it when run elevated, with the revert
   command if it is disabled; nothing writes it.
 - **No automatic registry writes.** `GlobalTimerResolutionRequests` is reported by
-  `query`/`status` and only changed by an explicit `timres global on|off` (which
+  `query`/`status` and only changed by an explicit `ticktune global on|off` (which
   refuses to run unelevated).
 - **No hardcoded "best" value.** The result is per machine, BIOS, power plan and
   driver set. Run `bench` again after a platform change.
@@ -229,11 +231,11 @@ On Windows, a normal release build is enough (MSVC or GNU toolchain):
 
 ```sh
 cargo build --release
-# target\release\timres.exe
+# target\release\ticktune.exe
 ```
 
-Put that directory on `PATH`, or replace `timres` in the examples with
-`.\target\release\timres.exe`.
+Put that directory on `PATH`, or replace `ticktune` in the examples with
+`.\target\release\ticktune.exe`.
 
 From Linux, install the mingw-w64 linker, then cross-compile; no MSVC, no runtime
 DLLs:
@@ -242,7 +244,7 @@ DLLs:
 rustup target add x86_64-pc-windows-gnu
 sudo apt install gcc-mingw-w64-x86-64   # Debian/Ubuntu; the CI build uses this package
 cargo build --release --target x86_64-pc-windows-gnu
-# target/x86_64-pc-windows-gnu/release/timres.exe
+# target/x86_64-pc-windows-gnu/release/ticktune.exe
 ```
 
 ## 📁 Layout

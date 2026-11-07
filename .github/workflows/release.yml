@@ -25,8 +25,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/x86_64-pc-windows-gnu/release/timres.exe dist/
-          cd dist && sha256sum timres.exe > timres.exe.sha256
+          cp target/x86_64-pc-windows-gnu/release/ticktune.exe dist/
+          cd dist && sha256sum ticktune.exe > ticktune.exe.sha256
 
       - name: Publish
         env:
@@ -34,4 +34,4 @@ jobs:
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" dist/timres.exe dist/timres.exe.sha256 --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/ticktune.exe dist/ticktune.exe.sha256 --clobber

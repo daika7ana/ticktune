@@ -1,14 +1,14 @@
 [package]
-name = "timres"
+name = "ticktune"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Measure the Windows timer resolution that actually fits the machine, then apply it"
 license = "MIT"
-repository = "https://github.com/daika7ana/win-timer-resolution"
+repository = "https://github.com/daika7ana/ticktune"
 
 [[bin]]
-name = "timres"
+name = "ticktune"
 path = "src/main.rs"
 
 [profile.release]

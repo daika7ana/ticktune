@@ -26,7 +26,7 @@ pub struct Report {
     pub partial: bool,
 }
 
-/// Progress goes to stderr so `timres bench > results.txt` stays clean.
+/// Progress goes to stderr so `ticktune bench > results.txt` stays clean.
 pub fn run(opts: &Options) -> Result<Report, String> {
     // Two benches share one tick, so each would corrupt the other's curve.
     let _guard = nt::bench_instance()?;
