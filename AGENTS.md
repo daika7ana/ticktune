@@ -25,8 +25,9 @@ build.
 
 ## Layout / compile gates
 
-- `src/stats.rs` — pure math, grids, recommendation; only module compiled on
-  every OS. Put testable logic here and add unit tests (`#[cfg(test)]` in-file).
+- `src/stats.rs` — pure math, grids, recommendation; the only module compiled on
+  every OS outside test builds. Put testable logic here and add unit tests
+  (`#[cfg(test)]` in-file).
 - `src/measure.rs` — `Sleep(1)` sampling on QPC; Windows only.
 - `src/scan.rs` — dense low band + coarse sweep + stability re-check; Windows only.
 - `src/nt.rs` — `NtSetTimerResolution`/`NtQueryTimerResolution`, registry, BCD
@@ -52,10 +53,11 @@ revive the old name.
 - Write output through `outln!`/`out` and diagnostics through `errln!`/`err`,
   never `println!`/`eprintln!`: stdout or stderr may be closed
   (`ticktune bench | head`) and a failed write must not abort a running scan.
-- Defaults/thresholds live in code and are mirrored in `README.md` and the
-  `HELP` string. Keep all three in sync when changing them: bench 200
-  samples (max 1000), measure 1000 (max 100000); usable = interference ≤ 2 %,
-  p50 ≥ 0.99 ms, p95 ≤ 2.5 ms; power budget p50 ≤ 1.35 / p95 ≤ 2.0 ms.
+- Defaults/thresholds live in code and are mirrored in `README.md`; the sample
+  defaults also appear in the `HELP` string. Keep them in sync when changing
+  them: bench 200 samples (max 1000), measure 1000 (max 100000); usable =
+  interference ≤ 2 %, p50 ≥ 0.99 ms, p95 ≤ 2.5 ms; power budget
+  p50 ≤ 1.35 / p95 ≤ 2.0 ms.
 
 ## Invariants
 
@@ -68,14 +70,17 @@ revive the old name.
 - The logon task XML behaviours are pinned by tests — preserve `--no-esc`
   (ESC is desktop-wide), `StopExisting`, `PT0S` execution limit, battery
   allowed, least privilege, and UTF-16 BOM decoding when editing `persist.rs`.
+  The arguments also carry `--from-task`, which is what silences `apply`'s
+  `--no-esc` warning, and the Description carries `MARKER`; `install_startup`
+  and `remove_startup` refuse to touch a same-named task that lacks the marker.
 - The task principal is `S4U` with the current user's `UserId`. That runs the
   console-subsystem holder on a non-interactive desktop, so no console window
   flashes at logon; `InteractiveToken` would show one before `main` runs. S4U
   stores no password and needs the "Log on as a batch job" right (administrators
   have it); it is only safe because `--persist` already requires global mode.
-- `apply` is a holder, not a sampler: it calls
-  `ignore_timer_resolution_throttling()`, never `prepare_sampling()` (which
-  also raises the thread to time-critical for the process lifetime).
+- `apply` is a holder that also takes 50 plain samples for its `observed` line:
+  it calls `ignore_timer_resolution_throttling()`, never `prepare_sampling()`
+  (which also raises the thread to time-critical for the process lifetime).
 
 ## Build / release
 

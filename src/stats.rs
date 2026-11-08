@@ -6,7 +6,7 @@
 pub enum Prefer {
     /// Smallest `Sleep(1)` overshoot.
     Latency,
-    /// Coarsest period that still lands inside the latency budget.
+    /// Middle of the coarsest band that still lands inside the latency budget.
     Power,
 }
 
@@ -82,22 +82,23 @@ impl Stats {
     }
 }
 
-/// Index of the coarsest point that still lands inside the latency budget.
-///
-/// `Prefer::Power` asks for the cheapest setting that keeps the latency; the
-/// winner can sit on the edge of the plateau, which `scan` warns about.
-pub fn coarsest_within_budget(points: &[Stats]) -> Option<usize> {
-    points
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.within_budget())
-        .max_by_key(|(_, s)| s.period_100ns)
-        .map(|(i, _)| i)
-}
-
 /// How close to the best median a point must be to count as the same setting.
 /// The quantisation plateaus are ~0.5 ms apart, so this separates them easily.
 pub const BAND_MARGIN_MS: f64 = 0.05;
+
+/// Index of the usable point in `group` closest to the middle of its period
+/// range. The edges of a plateau are marginal by definition, so the middle is
+/// the value that reproduces across runs.
+fn middle_of(points: &[Stats], group: &Plateau) -> Option<usize> {
+    let mid = group.lo_100ns + (group.hi_100ns - group.lo_100ns) / 2;
+    points[group.start..group.start + group.points]
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.usable())
+        .map(|(k, s)| (group.start + k, s))
+        .min_by_key(|(_, s)| s.period_100ns.abs_diff(mid))
+        .map(|(index, _)| index)
+}
 
 /// Index of the recommended point and the plateau it belongs to.
 ///
@@ -116,13 +117,28 @@ pub fn choose_band(points: &[Stats]) -> Option<(usize, Plateau)> {
     let group = plateaus(points)
         .into_iter()
         .find(|p| best_index >= p.start && best_index < p.start + p.points)?;
-    let mid = group.lo_100ns + (group.hi_100ns - group.lo_100ns) / 2;
-    let (index, _) = points[group.start..group.start + group.points]
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.usable())
-        .map(|(k, s)| (group.start + k, s))
-        .min_by_key(|(_, s)| s.period_100ns.abs_diff(mid))?;
+    let index = middle_of(points, &group)?;
+    Some((index, group))
+}
+
+/// `Prefer::Power`: the middle of the coarsest plateau that is entirely inside
+/// the latency budget.
+///
+/// Taking the coarsest in-budget *point* (the obvious rule) recommends whatever
+/// noisy sample happened to be last, including an isolated fast point above a
+/// slow band. A lone point is excluded for the same reason: a one-point plateau
+/// above a slow run is measurement noise, not a setting.
+pub fn choose_power_band(points: &[Stats]) -> Option<(usize, Plateau)> {
+    let group = plateaus(points)
+        .into_iter()
+        .filter(|g| g.points > 1)
+        .filter(|g| {
+            points[g.start..g.start + g.points]
+                .iter()
+                .all(Stats::within_budget)
+        })
+        .max_by_key(|g| g.hi_100ns)?;
+    let index = middle_of(points, &group)?;
     Some((index, group))
 }
 
@@ -205,9 +221,35 @@ pub fn classify_global(baseline_ms: f64, child_ms: f64, coarsest_ms: f64) -> Ver
     }
 }
 
+/// Timer units per millisecond: 100 ns each.
+const UNITS_PER_MS: f64 = 10_000.0;
+
 /// Convert a period in 100 ns units to milliseconds.
 pub fn ms(period_100ns: u32) -> f64 {
-    period_100ns as f64 / 10_000.0
+    period_100ns as f64 / UNITS_PER_MS
+}
+
+/// Convert milliseconds to timer units, rounding to the nearest one. Values
+/// outside the `u32` range saturate, which the caller's range check rejects.
+pub fn period_from_ms(ms: f64) -> u32 {
+    (ms * UNITS_PER_MS).round() as u32
+}
+
+/// The one line `measure` prints. `verify-global` parses it back out of a
+/// child's stdout, so the format lives next to its parser instead of in two
+/// files that can drift apart.
+pub fn summary_line(p50_ms: f64, p95_ms: f64, interference: f64) -> String {
+    format!(
+        "p50={p50_ms:.3} p95={p95_ms:.3} interference={:.1}%",
+        interference * 100.0
+    )
+}
+
+/// Read the p50 back out of `summary_line`'s output.
+pub fn parse_p50(text: &str) -> Option<f64> {
+    text.split_whitespace()
+        .find_map(|w| w.strip_prefix("p50="))
+        .and_then(|v| v.parse().ok())
 }
 
 /// Coarse scan step: 10 us.
@@ -404,18 +446,59 @@ mod tests {
     }
 
     #[test]
-    fn power_prefers_coarsest_within_budget() {
+    fn power_takes_the_middle_of_the_coarsest_band_in_budget() {
         let stats = vec![
-            stat(5000, 1.10, 1.2, 0.0),
-            stat(6000, 1.20, 1.5, 0.0), // within budget
-            stat(8000, 1.30, 1.9, 0.0), // coarsest within budget <- best
-            stat(9000, 1.40, 1.5, 0.0), // usable, p50 too high for budget
+            stat(5000, 1.505, 1.51, 0.0), // over budget
+            stat(6000, 1.100, 1.20, 0.0),
+            stat(6100, 1.105, 1.20, 0.0),
+            stat(6200, 1.110, 1.20, 0.0), // coarsest in-budget band, middle 6100
+            stat(7000, 1.400, 1.50, 0.0), // usable, p50 over budget
         ];
-        assert_eq!(coarsest_within_budget(&stats), Some(2));
+        let (index, band) = choose_power_band(&stats).unwrap();
+        assert_eq!((band.lo_100ns, band.hi_100ns), (6000, 6200));
+        assert_eq!(stats[index].period_100ns, 6100);
+        assert!(stats[index].within_budget());
 
         // Nothing within budget.
         let none = vec![stat(5000, 1.50, 1.6, 0.0), stat(6000, 1.45, 1.5, 0.0)];
-        assert_eq!(coarsest_within_budget(&none), None);
+        assert!(choose_power_band(&none).is_none());
+
+        // An isolated in-budget point above a slow band is noise, not a setting;
+        // picking it by period (the old rule) would recommend 5400.
+        let gap = vec![
+            stat(5000, 1.505, 1.51, 0.0),
+            stat(5106, 1.017, 1.52, 0.0),
+            stat(5110, 1.020, 1.52, 0.0),
+            stat(5200, 1.519, 1.52, 0.0),
+            stat(5400, 1.030, 1.40, 0.0),
+        ];
+        let (index, band) = choose_power_band(&gap).unwrap();
+        assert_eq!((band.lo_100ns, band.hi_100ns), (5106, 5110));
+        assert!(gap[index].within_budget());
+        assert!(gap[index].period_100ns <= 5110);
+    }
+
+    #[test]
+    fn period_from_ms_rounds_to_units() {
+        assert_eq!(period_from_ms(0.5119), 5119);
+        assert_eq!(period_from_ms(0.5), 5000);
+        assert_eq!(period_from_ms(15.625), 156_250);
+        // Below half a unit rounds to 0; `apply` rejects that with its own message.
+        assert_eq!(period_from_ms(0.00001), 0);
+        assert!((ms(5119) - 0.5119).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summary_line_parses_back() {
+        let line = summary_line(1.017, 1.517, 0.015);
+        assert_eq!(parse_p50(&line), Some(1.017));
+        // A child that prints more than one line still parses.
+        assert_eq!(
+            parse_p50(&format!("note: something\n{line}\n")),
+            Some(1.017)
+        );
+        assert_eq!(parse_p50("median=1.017"), None);
+        assert_eq!(parse_p50("p50=notanumber"), None);
     }
 
     #[test]

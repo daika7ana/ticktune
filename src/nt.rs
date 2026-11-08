@@ -62,6 +62,7 @@ unsafe extern "system" {
     fn SetProcessInformation(process: Handle, class: u32, info: *mut c_void, size: u32) -> i32;
     fn CreateMutexW(security: *mut c_void, owner: i32, name: *const u16) -> Handle;
     fn GetLastError() -> u32;
+    fn SetLastError(code: u32);
     fn CloseHandle(handle: Handle) -> i32;
 }
 
@@ -233,10 +234,13 @@ impl Drop for InstanceGuard {
 
 const ERROR_ALREADY_EXISTS: u32 = 183;
 
-/// Claim the bench name for this process. Two benches share one tick, so each
-/// would measure the other's request instead of its own.
+/// Claim the measurement name for this process. Two runs share one tick, so
+/// each would measure the other's request instead of its own.
 pub fn bench_instance() -> Result<InstanceGuard, String> {
     let name = wide("Local\\ticktune-bench");
+    // `CreateMutexW` reports "already exists" through the last error, which is
+    // only meaningful if nothing earlier in the process left a stale value.
+    unsafe { SetLastError(0) };
     let handle = unsafe { CreateMutexW(core::ptr::null_mut(), 0, name.as_ptr()) };
     if handle.is_null() {
         return Err("CreateMutexW failed".to_string());
@@ -245,7 +249,10 @@ pub fn bench_instance() -> Result<InstanceGuard, String> {
         unsafe {
             CloseHandle(handle);
         }
-        return Err("another ticktune bench is already running; wait for it to finish".to_string());
+        return Err(
+            "another ticktune measurement (bench or verify-global) is already running; wait for it to finish"
+                .to_string(),
+        );
     }
     Ok(InstanceGuard(handle))
 }

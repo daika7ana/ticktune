@@ -7,13 +7,20 @@ use std::process::Command;
 
 pub const TASK_NAME: &str = "ticktune";
 
+/// Written into the task's Description and checked before overwriting or
+/// deleting it, so a same-named task we did not create is left alone.
+const MARKER: &str = "Managed by ticktune.";
+
 /// What the logon task currently runs.
 pub struct Logon {
     pub period_100ns: u32,
-    /// The task no longer matches this build: it points at another exe, or it
-    /// was registered with a principal that still flashes a console (pre-S4U).
-    /// Re-running `--persist` fixes both.
+    /// The task no longer matches this build: it points at another exe, it was
+    /// registered with a principal that still flashes a console (pre-S4U), or
+    /// it predates the `--from-task` argument. Re-running `--persist` fixes all.
     pub stale: bool,
+    /// The task's XML carries our marker. A task without it may belong to
+    /// someone else and must not be overwritten or deleted.
+    pub owned: bool,
 }
 
 #[cfg(windows)]
@@ -43,7 +50,7 @@ fn task_xml(exe: &str, period_100ns: u32, user: &str) -> String {
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n\
 <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n\
   <RegistrationInfo>\r\n\
-    <Description>Holds a Windows timer resolution request. Managed by ticktune.</Description>\r\n\
+    <Description>Holds a Windows timer resolution request. {}</Description>\r\n\
   </RegistrationInfo>\r\n\
   <Triggers>\r\n\
     <LogonTrigger>\r\n\
@@ -79,10 +86,11 @@ fn task_xml(exe: &str, period_100ns: u32, user: &str) -> String {
   <Actions Context=\"Author\">\r\n\
     <Exec>\r\n\
       <Command>{}</Command>\r\n\
-      <Arguments>apply --resolution {} --no-console --no-esc</Arguments>\r\n\
+      <Arguments>apply --resolution {} --no-console --no-esc --from-task</Arguments>\r\n\
     </Exec>\r\n\
   </Actions>\r\n\
 </Task>\r\n",
+        MARKER,
         xml_escape(user),
         xml_escape(exe),
         period_100ns
@@ -99,8 +107,31 @@ fn current_user() -> Result<String, String> {
     }
 }
 
+/// Refuse to overwrite or delete a task with our name that we cannot prove we
+/// created, and hand back the parsed task when there is one. An unreadable XML
+/// is not evidence of ownership.
+fn ensure_ours() -> Result<Option<Logon>, String> {
+    if !task_exists() {
+        return Ok(None);
+    }
+    match logon_task() {
+        Some(task) if task.owned => Ok(Some(task)),
+        // Unreadable is not "absent": the name is still taken.
+        _ => Err(not_ours()),
+    }
+}
+
+fn not_ours() -> String {
+    format!(
+        "a task named {TASK_NAME} already exists and does not carry this build's marker; \
+         inspect it with `schtasks /Query /TN {TASK_NAME} /XML` and delete it by hand, \
+         then re-run"
+    )
+}
+
 /// Register the logon task. Replaces an existing one.
 pub fn install_startup(period_100ns: u32) -> Result<(), String> {
+    let _ = ensure_ours()?;
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let user = current_user()?;
     let path = std::env::temp_dir().join(format!("ticktune-task-{}.xml", std::process::id()));
@@ -146,11 +177,13 @@ pub fn task_exists() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Delete the task.
-pub fn remove_startup() -> Result<bool, String> {
-    if !task_exists() {
-        return Ok(false);
-    }
+/// Delete the task and report what was there. The caller checks afterwards
+/// whether the request is really gone: deleting a task does not stop a holder
+/// that already runs as S4U.
+pub fn remove_startup() -> Result<Option<Logon>, String> {
+    let Some(task) = ensure_ours()? else {
+        return Ok(None);
+    };
     // S4U holders are not tied to the interactive session, so deleting the task
     // alone would leave the request raised until reboot.
     let _ = schtasks().args(["/End", "/TN", TASK_NAME]).output();
@@ -161,7 +194,14 @@ pub fn remove_startup() -> Result<bool, String> {
     if !out.status.success() {
         return Err(command_error("/Delete", &out));
     }
-    Ok(true)
+    Ok(Some(task))
+}
+
+/// Compare a path `schtasks` echoed back against ours. The export may quote it
+/// or pad it, and a mismatch marks the task stale forever if we do not allow
+/// for that.
+fn normalise(path: &str) -> String {
+    path.trim().trim_matches('"').trim().to_lowercase()
 }
 
 /// The logon task's period and whether it still matches this build.
@@ -173,18 +213,27 @@ pub fn logon_task() -> Option<Logon> {
     if !out.status.success() {
         return None;
     }
-    let xml = decode(&out.stdout);
-    let args = extract_tag(&xml, "Arguments")?;
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string());
+    parse_logon(&decode(&out.stdout), exe.as_deref())
+}
+
+/// Parse one task definition. Split from `logon_task` so the ownership and
+/// staleness rules can be tested without `schtasks`. `exe` is our own path, or
+/// `None` when it cannot be read.
+fn parse_logon(xml: &str, exe: Option<&str>) -> Option<Logon> {
+    let args = extract_tag(xml, "Arguments")?;
     let period_100ns = parse_period(&args)?;
-    let stale = match (extract_tag(&xml, "Command"), std::env::current_exe()) {
-        (Some(command), Ok(exe)) => !command
-            .trim()
-            .eq_ignore_ascii_case(&exe.display().to_string()),
+    let stale = match (extract_tag(xml, "Command"), exe) {
+        (Some(command), Some(exe)) => normalise(&command) != normalise(exe),
         _ => false,
-    } || !xml.contains("<LogonType>S4U</LogonType>");
+    } || !xml.contains("<LogonType>S4U</LogonType>")
+        || !args.contains("--from-task");
     Some(Logon {
         period_100ns,
         stale,
+        owned: xml.contains(MARKER),
     })
 }
 
@@ -271,7 +320,7 @@ fn parse_period(arguments: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, extract_tag, parse_period, task_xml};
+    use super::{MARKER, decode, extract_tag, normalise, parse_logon, parse_period, task_xml};
 
     #[test]
     fn task_xml_round_trips_command_and_period() {
@@ -295,6 +344,60 @@ mod tests {
         let xml = task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me");
         let args = extract_tag(&xml, "Arguments").unwrap();
         assert!(args.contains("--no-esc"), "arguments were: {args}");
+        // The marker is what makes --no-esc valid; `apply` warns without it.
+        assert!(args.contains("--from-task"), "arguments were: {args}");
+    }
+
+    #[test]
+    fn parse_logon_reads_ownership_and_staleness() {
+        let xml = task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me");
+        let task = parse_logon(&xml, Some("C:\\ticktune.exe")).unwrap();
+        assert_eq!(task.period_100ns, 5000);
+        assert!(task.owned);
+        assert!(!task.stale);
+
+        // No marker: someone else's task under our name. Install and remove
+        // both refuse it, so this flag is what prevents the clobber.
+        let foreign = xml.replace(MARKER, "someone else");
+        assert!(!parse_logon(&foreign, None).unwrap().owned);
+
+        // InteractiveToken would flash a console before `main` runs.
+        let interactive = xml.replace(
+            "<LogonType>S4U</LogonType>",
+            "<LogonType>InteractiveToken</LogonType>",
+        );
+        assert!(
+            parse_logon(&interactive, Some("C:\\ticktune.exe"))
+                .unwrap()
+                .stale
+        );
+
+        // Written before --from-task existed: re-running --persist upgrades it.
+        let old = xml.replace(" --from-task", "");
+        assert!(parse_logon(&old, Some("C:\\ticktune.exe")).unwrap().stale);
+
+        // Unreadable is not ours, and not a task we can report on.
+        assert!(parse_logon("<Task/>", None).is_none());
+    }
+
+    #[test]
+    fn task_carries_the_ownership_marker() {
+        // `install_startup` and `remove_startup` refuse to touch a same-named
+        // task without this, so it must survive edits to the XML.
+        let xml = task_xml("C:\\ticktune.exe", 5000, "DESKTOP\\me");
+        assert!(xml.contains(MARKER));
+    }
+
+    #[test]
+    fn stale_check_tolerates_quotes_and_case() {
+        assert_eq!(
+            normalise(" \"C:\\Tools\\TickTune.exe\" "),
+            "c:\\tools\\ticktune.exe"
+        );
+        assert_eq!(
+            normalise("C:\\Tools\\TickTune.exe"),
+            normalise("\"c:\\tools\\ticktune.exe\"")
+        );
     }
 
     #[test]

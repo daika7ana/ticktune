@@ -29,6 +29,7 @@ commands:
   query                     show the timer range, mode, and current state
   bench                     measure the timer curve and recommend a period
   apply                     hold one timer request until ESC or Ctrl+C
+                            (with --persist it installs the holder and returns)
   status                    sample this process, then print the query block
   measure                   print p50/p95/interference for this process
   verify-global             check whether requests affect other processes
@@ -43,6 +44,7 @@ options:
   --persist                 apply: install and start the logon holder
   --no-console              apply: detach the console (no Ctrl+C)
   --no-esc                  apply: internal, used by the generated logon task
+  --from-task               apply: internal, marks the generated logon task
   --samples N               bench: per point (default 200, max 1000)
                             measure: total (default 1000, max 100000)
   --prefer latency|power    bench: optimize for latency (default) or power
@@ -51,11 +53,11 @@ options:
 notes:
   apply needs exactly one of --resolution or --ms, within the platform range.
   apply --persist requires GlobalTimerResolutionRequests=1 (see verify-global).
-  bench stops early on ESC; --samples 1000 takes about 13 minutes.
-  startup remove also ends a running holder.";
+  bench stops early on ESC; --samples 1000 takes about 14 minutes.
+  startup remove ends a running holder, and warns if the tick stays raised.";
 
-    /// Samples per point in a bench run. 547 points at 1000 samples is ~11
-    /// minutes; a larger number would look like a hang.
+    /// Samples per point in a bench run. 546 grid points plus the re-check at
+    /// 1000 samples is ~14 minutes; a larger number would look like a hang.
     const MAX_BENCH_SAMPLES: usize = 1000;
 
     /// stdout may be a closed pipe (`ticktune bench | head`); a failed write must
@@ -211,19 +213,18 @@ notes:
             None => outln!("{:<20}unknown (run elevated to read)", "dynamic tick"),
         }
         let startup = match persist::logon_task() {
-            Some(task) => {
-                let stale = if task.stale {
-                    " (stale: re-run apply --persist)"
-                } else {
-                    ""
-                };
-                format!(
-                    "{} task: {} x 100ns{}",
-                    persist::TASK_NAME,
-                    task.period_100ns,
-                    stale
-                )
-            }
+            // No marker: not ours to manage. Both `--persist` and `startup
+            // remove` refuse it, so pointing at them would be a dead end.
+            Some(task) if !task.owned => format!(
+                "{} task: present but not created by this build (delete it by hand)",
+                persist::TASK_NAME
+            ),
+            Some(task) if task.stale => format!(
+                "{} task: {} x 100ns (stale: re-run apply --persist)",
+                persist::TASK_NAME,
+                task.period_100ns
+            ),
+            Some(task) => format!("{} task: {} x 100ns", persist::TASK_NAME, task.period_100ns),
             None if persist::task_exists() => "present (arguments unreadable)".to_string(),
             None => "none".to_string(),
         };
@@ -263,7 +264,7 @@ notes:
         let samples = match samples {
             Some(n) if n > MAX_BENCH_SAMPLES => {
                 errln!(
-                    "note: bench caps --samples at {MAX_BENCH_SAMPLES} so a run stays under ~13 minutes"
+                    "note: bench caps --samples at {MAX_BENCH_SAMPLES} so a run stays under ~14 minutes"
                 );
                 MAX_BENCH_SAMPLES
             }
@@ -396,12 +397,6 @@ notes:
             "unstable (rerun when the machine is quieter)"
         };
         out(format_args!("  {:<12}{}", "stability", stability));
-        if report.power_edge {
-            out(format_args!(
-                "  {:<12}the next tested value is outside the budget; the edge can move between runs",
-                "note"
-            ));
-        }
         out(format_args!(
             "  {:<12}ticktune apply --resolution {}",
             "next step", chosen.period_100ns
@@ -415,6 +410,7 @@ notes:
         let mut persist = false;
         let mut no_console = false;
         let mut esc = true;
+        let mut from_task = false;
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
@@ -434,21 +430,37 @@ notes:
                 }
                 "--persist" => persist = true,
                 "--no-console" => no_console = true,
-                "--no-esc" => esc = false, // internal: the generated logon task is the only caller
+                // Internal: the generated logon task passes both of these.
+                "--no-esc" => esc = false,
+                "--from-task" => from_task = true,
                 a => return Err(Fail::Usage(format!("unknown apply argument: {a}"))),
             }
             i += 1;
         }
 
+        // A hard error here would make holders installed by an older build exit
+        // with code 2 at the next logon, silently.
+        if !esc && !from_task {
+            errln!("warning: --no-esc is internal and only meant for the generated logon task");
+        }
+
         let period = match (resolution, ms_arg) {
             (Some(r), None) => r,
-            (None, Some(m)) => (m * 10_000.0).round() as u32,
+            (None, Some(m)) => {
+                if !m.is_finite() || m <= 0.0 {
+                    return Err(Fail::Usage(format!("--ms must be a positive number: {m}")));
+                }
+                stats::period_from_ms(m)
+            }
             _ => {
                 return Err(Fail::Usage(
                     "exactly one of --resolution or --ms is required".into(),
                 ));
             }
         };
+        if period == 0 {
+            return Err(Fail::Usage("the period must be at least 1 x 100ns".into()));
+        }
 
         let range = nt::query().map_err(Fail::Op)?;
         if period < range.finest || period > range.coarsest {
@@ -477,19 +489,48 @@ notes:
             );
         }
         outln!("requesting {} ms", fmt_period(period));
+        // `nt::set` reports success even when the platform silently falls back
+        // to a coarser tick, so show what this process actually sleeps. Plain
+        // samples only: no `prepare_sampling`, which raises this thread for the
+        // whole process lifetime and would make the holder cost more.
+        let observed = Stats::from_samples(period, &mut measure::sample_sleep(50));
+        outln!("observed     p50 {:.3} ms", observed.p50_ms);
         if persist {
             persist::install_startup(period).map_err(Fail::Op)?;
-            // The task owns the request from here, so this process can exit
-            // instead of blocking the shell that started it.
+            // `/Run` returning success does not prove the holder is alive, so
+            // hand our own request over and wait for the tick to move.
+            let _ = nt::release();
             match persist::start_startup() {
-                Ok(()) => outln!(
-                    "logon task: {} installed and running (edit it in Task Scheduler)",
-                    persist::TASK_NAME
-                ),
+                Ok(()) => {}
                 Err(e) => {
                     errln!("warning: task installed but could not start now: {e}");
-                    errln!("         it will start at the next logon.");
+                    errln!("         check `ticktune query` before relying on it.");
+                    return Ok(());
                 }
+            }
+            // Another process already holding a finer request looks the same as
+            // our holder starting; a dead holder on a quiet machine does not.
+            let mut held = false;
+            for _ in 0..40 {
+                if nt::query().is_ok_and(|r| r.current <= period) {
+                    held = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if held {
+                outln!(
+                    "logon task: {} installed and running (edit it in Task Scheduler)",
+                    persist::TASK_NAME
+                );
+            } else {
+                errln!(
+                    "warning: task {} installed but no holder request appeared within 2 s.",
+                    persist::TASK_NAME
+                );
+                errln!(
+                    "         check `ticktune query`; a non-admin S4U task needs the \"Log on as a batch job\" right."
+                );
             }
             return Ok(());
         }
@@ -528,10 +569,8 @@ notes:
         let mut v = measure::sample_sleep(samples);
         let s = Stats::from_samples(0, &mut v);
         outln!(
-            "p50={:.3} p95={:.3} interference={:.1}%",
-            s.p50_ms,
-            s.p95_ms,
-            s.interference * 100.0,
+            "{}",
+            stats::summary_line(s.p50_ms, s.p95_ms, s.interference)
         );
     }
 
@@ -565,6 +604,9 @@ notes:
     }
 
     fn cmd_verify_global() -> Result<(), Fail> {
+        // This command raises the finest request and spawns a sampler, so it
+        // must not run beside a bench: either would corrupt the other's curve.
+        let _guard = nt::bench_instance().map_err(Fail::Op)?;
         let range = nt::query().map_err(Fail::Op)?;
         if range.current < range.coarsest {
             // The test needs the no-request timer. Anything already holding a
@@ -610,10 +652,7 @@ notes:
             .output()
             .map_err(|e| Fail::Op(format!("spawn measure: {e}")))?;
         let text = String::from_utf8_lossy(&out.stdout);
-        let child = text
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix("p50="))
-            .and_then(|v| v.parse::<f64>().ok())
+        let child = stats::parse_p50(&text)
             .ok_or_else(|| Fail::Op(format!("could not parse child output: {}", text.trim())))?;
 
         match stats::classify_global(baseline, child, coarsest) {
@@ -663,11 +702,25 @@ notes:
     fn cmd_startup(args: &[String]) -> Result<(), Fail> {
         match args.first().map(String::as_str) {
             Some("remove") if args.len() == 1 => {
+                // Deleting the task is not proof the holder stopped: `/End` can
+                // fail silently, and an S4U holder outlives the session.
                 let removed = persist::remove_startup().map_err(Fail::Op)?;
                 outln!(
                     "logon task: {}",
-                    if removed { "removed" } else { "not installed" }
+                    if removed.is_some() {
+                        "removed"
+                    } else {
+                        "not installed"
+                    }
                 );
+                if let (Some(task), Ok(range)) = (removed, nt::query()) {
+                    if range.current <= task.period_100ns {
+                        errln!(
+                            "warning: the tick is still {:.3} ms; a holder that was running keeps its request until reboot",
+                            stats::ms(range.current)
+                        );
+                    }
+                }
                 Ok(())
             }
             Some("remove") => Err(Fail::Usage("startup remove takes no arguments".into())),

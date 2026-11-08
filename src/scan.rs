@@ -17,10 +17,8 @@ pub struct Report {
     /// Every measured point, in scan order.
     pub points: Vec<Stats>,
     pub chosen: Option<Stats>,
-    /// The plateau the recommendation came from, when it came from one.
+    /// The plateau the recommendation came from.
     pub band: Option<Plateau>,
-    /// The power pick is the last value inside the budget; the next one is not.
-    pub power_edge: bool,
     /// Whether the winner reproduced within 40 us on a second pass.
     pub stable: bool,
     /// The user stopped the scan before it finished.
@@ -34,10 +32,10 @@ pub fn run(opts: &Options) -> Result<Report, String> {
 
     let range = nt::query()?;
     // A request below the scanned ceiling props up every candidate above it.
-    // A holder at or above 1 ms never meets a scanned candidate, so stay quiet.
-    if range.current < stats::MAX_USEFUL_100NS {
+    // A holder above the ceiling never meets a scanned candidate, so stay quiet.
+    if range.current <= stats::MAX_USEFUL_100NS {
         err(format_args!(
-            "warning: another process holds a {:.3} ms request. Candidates above that measure the same value; close it for an accurate upper range.",
+            "warning: another process holds a {:.3} ms request. Candidates at or above that measure the same value; close it for an accurate upper range.",
             ms(range.current)
         ));
     }
@@ -114,18 +112,13 @@ fn scan(opts: &Options, range: Range) -> Result<Report, String> {
     }
 
     let pick = match opts.prefer {
-        Prefer::Latency => stats::choose_band(&points).map(|(i, band)| (i, Some(band), false)),
-        Prefer::Power => stats::coarsest_within_budget(&points)
-            .map(|i| {
-                let edge = points.get(i + 1).is_some_and(|next| !next.within_budget());
-                (i, None, edge)
-            })
-            // Nothing inside the budget: fall back to the latency winner.
-            .or_else(|| stats::choose_band(&points).map(|(i, band)| (i, Some(band), false))),
+        Prefer::Latency => stats::choose_band(&points),
+        // Nothing inside the budget: fall back to the latency winner.
+        Prefer::Power => stats::choose_power_band(&points).or_else(|| stats::choose_band(&points)),
     };
-    let (chosen, band, power_edge) = match pick {
-        Some((i, band, edge)) => (Some(points[i].clone()), band, edge),
-        None => (None, None, false),
+    let (chosen, band) = match pick {
+        Some((i, band)) => (Some(points[i].clone()), Some(band)),
+        None => (None, None),
     };
 
     let stable = match (&chosen, partial) {
@@ -141,7 +134,6 @@ fn scan(opts: &Options, range: Range) -> Result<Report, String> {
         points,
         chosen,
         band,
-        power_edge,
         stable,
         partial,
     })

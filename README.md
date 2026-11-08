@@ -13,8 +13,8 @@ Measure the timer resolution Windows actually delivers, then request the best on
 Windows reports a nominal range, but the latency a process really sees is quantised
 and not monotonic: the nominal minimum is often slower than a slightly coarser
 request. `ticktune` sweeps the usable range, measures real `Sleep(1)` latency at each
-step, and recommends the point with the lowest consistent latency — or the coarsest
-point that stays within a latency budget.
+step, and recommends the point with the lowest consistent latency — or the middle
+of the coarsest band that stays within a latency budget.
 
 Single static executable. No dependencies, no driver, no service.
 
@@ -24,8 +24,9 @@ Single static executable. No dependencies, no driver, no service.
   `QueryPerformanceCounter`, and the scan reports the distribution, not one number.
 - **Finds the real knee.** A fixed 100 ns sweep over the first 50 µs above the
   floor catches the narrow fast band that a coarse step can walk straight past.
-- **Latency or power.** `--prefer latency` minimises p50/p95; `--prefer power` takes
-  the coarsest period that still meets the latency budget.
+- **Latency or power.** `--prefer latency` minimises p50 under the p95 cap;
+  `--prefer power` takes the coarsest band that still meets the latency budget,
+  and its middle.
 - **Two modes.** Per-process by default (no admin needed); machine-wide only after
   an explicit `ticktune global on` and a reboot.
 - **Nothing hidden.** The registry key and the dynamic-tick setting are reported,
@@ -111,11 +112,11 @@ plateau are marginal by definition, so repeated runs agree on the middle and onl
 the edge rows wobble. `stable` means a re-check of the winner agreed with the first
 pass; `unstable` means the machine was noisy — rerun when it is quieter.
 `--samples 100` gives a quicker, noisier answer; the default 200 is two to three
-minutes, and the cap of 1000 is about thirteen. Press `ESC` to stop early — the
+minutes, and the cap of 1000 is about fourteen. Press `ESC` to stop early — the
 recommendation then covers the points measured so far. Use `--prefer power` if you
-would rather have the coarsest period inside the latency budget (p50 ≤ 1.35 ms and
-p95 ≤ 2.0 ms); it notes when the pick sits on the edge of the budget, and falls
-back to the latency pick if nothing qualifies. No point is ever recommended unless
+would rather have the coarsest *band* inside the latency budget (p50 ≤ 1.35 ms and
+p95 ≤ 2.0 ms); it recommends the middle of that band, and falls back to the latency
+pick if nothing qualifies. No point is ever recommended unless
 interference ≤ 2 %, p50 ≥ 0.99 ms and p95 ≤ 2.5 ms.
 
 `interference` is the share of samples that overshoot the median by more than 1 ms.
@@ -126,8 +127,11 @@ than this figure.
 ### 5. Try the value
 
 ```sh
-ticktune apply --resolution 5120
+ticktune apply --resolution 5119
 ```
+
+`apply` prints the period it requested and the p50 it actually measured, because
+Windows can report success and still ignore a request outside the honoured band.
 
 Keep the window open. The request belongs to this process alone, so `ticktune measure`
 in another terminal does not see it; to observe the effect system-wide, enable
@@ -138,23 +142,30 @@ no Ctrl+C, so use ESC.
 ### 6. Keep it across reboots (optional, machine-wide only)
 
 ```sh
-ticktune apply --resolution 5120 --persist
+ticktune apply --resolution 5119 --persist
 ```
 
 This registers a Task Scheduler task named `ticktune` that runs the holder 15 s
 after logon, starts it immediately, and returns — the task, not your shell, owns
-the request from then on. It runs as you, without elevation and without a
-console window. It is allowed on battery and never times out (the default 72 h
+the request from then on. It waits up to 2 s for the holder's request to appear
+and warns instead of claiming success if it does not. It runs as you, without
+elevation and without a
+console window. S4U needs the "Log on as a batch job" right, which administrators
+have; without it the task is created but never starts. It is allowed on battery
+and never times out (the default 72 h
 limit would stop it). It is started with `--no-esc`, because ESC is read
 desktop-wide and would otherwise end the holder from any window; stop it from
 Task Scheduler instead. Delete it with `ticktune startup remove`, which also
-ends a running holder. `--persist` is refused unless
+ends a running holder first, and warns if the tick is still raised afterwards.
+`--persist` is refused unless
 `GlobalTimerResolutionRequests` is `1` (in per-process mode the holder would
 only accelerate itself); that check reads the registry value, not the running
 boot, so reboot and run `ticktune verify-global` (step 2) first. Check the task
 after the next logon with `ticktune status`. It stores the exe path, so re-run
 `--persist` after rebuilding, moving, or upgrading the binary — `query` marks
-an outdated task as `stale`.
+an outdated task as `stale`. A task that lacks this build's marker in its
+description is refused by both `--persist` and `startup remove`; delete it by
+hand with `schtasks /Delete /TN ticktune /F`.
 
 ### 7. Undo everything
 
@@ -163,7 +174,10 @@ ticktune startup remove    # delete the logon holder
 ticktune global off        # elevated; takes effect after a reboot
 ```
 
-Any holder that is still running is ended with the task. No other state is left behind.
+Any holder that is still running is ended with the task. The command warns if the
+tick is still at or below that period afterwards, which means Windows refused to
+end the holder (or something else holds it); only a reboot clears a surviving
+holder. No other state is left behind.
 
 ## 📋 Commands
 
@@ -183,8 +197,8 @@ Any holder that is still running is ended with the task. No other state is left 
 Values are in 100 ns units; the output always shows milliseconds too.
 
 Exit codes: `0` success, `1` runtime failure (a failed Windows call, no usable
-range or measurement, or a second `bench` already running), `2` bad command line or
-argument.
+range or measurement, or a second `bench`/`verify-global` already running), `2` bad
+command line or argument.
 
 ## 🤔 Why this is not "just set 0.5 ms"
 
