@@ -23,6 +23,8 @@ pub struct Report {
     pub stable: bool,
     /// The user stopped the scan before it finished.
     pub partial: bool,
+    /// Whether the power rule (not the latency fallback) picked the winner.
+    pub power: bool,
 }
 
 /// Progress goes to stderr so `ticktune bench > results.txt` stays clean.
@@ -111,10 +113,13 @@ fn scan(opts: &Options, range: Range) -> Result<Report, String> {
         ));
     }
 
-    let pick = match opts.prefer {
-        Prefer::Latency => stats::choose_band(&points),
+    let (pick, power) = match opts.prefer {
+        Prefer::Latency => (stats::choose_band(&points), false),
         // Nothing inside the budget: fall back to the latency winner.
-        Prefer::Power => stats::choose_power_band(&points).or_else(|| stats::choose_band(&points)),
+        Prefer::Power => match stats::choose_power_band(&points) {
+            Some(pick) => (Some(pick), true),
+            None => (stats::choose_band(&points), false),
+        },
     };
     let (chosen, band) = match pick {
         Some((i, band)) => (Some(points[i].clone()), Some(band)),
@@ -136,5 +141,6 @@ fn scan(opts: &Options, range: Range) -> Result<Report, String> {
         band,
         stable,
         partial,
+        power,
     })
 }

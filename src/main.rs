@@ -344,7 +344,7 @@ notes:
 
         out(format_args!(""));
         out(format_args!("result"));
-        let suffix = match (prefer, chosen.within_budget()) {
+        let suffix = match (prefer, report.power) {
             (Prefer::Latency, _) => "",
             (Prefer::Power, true) => "  [power]",
             (Prefer::Power, false) => "  [power fallback]",
@@ -499,30 +499,45 @@ notes:
             persist::install_startup(period).map_err(Fail::Op)?;
             // `/Run` returning success does not prove the holder is alive, so
             // hand our own request over and wait for the tick to move.
-            let _ = nt::release();
-            match persist::start_startup() {
-                Ok(()) => {}
-                Err(e) => {
-                    errln!("warning: task installed but could not start now: {e}");
-                    errln!("         check `ticktune query` before relying on it.");
-                    return Ok(());
-                }
+            nt::release().map_err(Fail::Op)?;
+            // A tick already at or below `period` is not evidence of our holder:
+            // another process (or a previous holder) may already hold it. In that
+            // case a new request cannot move the tick, so skip the check rather
+            // than warn falsely. Record the baseline for the observable case.
+            let baseline = nt::query().map_err(Fail::Op)?.current;
+            if let Err(e) = persist::start_startup() {
+                errln!("warning: task installed but could not start now: {e}");
+                errln!("         check `ticktune query` before relying on it.");
+                return Err(Fail::Op(format!("could not start logon task: {e}")));
             }
-            // Another process already holding a finer request looks the same as
-            // our holder starting; a dead holder on a quiet machine does not.
-            let mut held = false;
-            for _ in 0..40 {
-                if nt::query().is_ok_and(|r| r.current <= period) {
-                    held = true;
-                    break;
+            let held = if baseline <= period {
+                // Already fine: may be our new holder or another process. Either
+                // way the tool cannot tell, so do not claim one.
+                true
+            } else {
+                // The tick was coarse; only a live holder can bring it down.
+                let mut seen = false;
+                for _ in 0..40 {
+                    if nt::query().is_ok_and(|r| r.current <= period) {
+                        seen = true;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+                seen
+            };
             if held {
-                outln!(
-                    "logon task: {} installed and running (edit it in Task Scheduler)",
-                    persist::TASK_NAME
-                );
+                if baseline <= period {
+                    outln!(
+                        "logon task: {} installed (tick already at or below target; check `ticktune query` to confirm the holder)",
+                        persist::TASK_NAME
+                    );
+                } else {
+                    outln!(
+                        "logon task: {} installed and running (edit it in Task Scheduler)",
+                        persist::TASK_NAME
+                    );
+                }
             } else {
                 errln!(
                     "warning: task {} installed but no holder request appeared within 2 s.",
@@ -652,6 +667,14 @@ notes:
             .output()
             .map_err(|e| Fail::Op(format!("spawn measure: {e}")))?;
         let text = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(Fail::Op(format!(
+                "measure child failed ({}): {}",
+                out.status,
+                stderr.trim()
+            )));
+        }
         let child = stats::parse_p50(&text)
             .ok_or_else(|| Fail::Op(format!("could not parse child output: {}", text.trim())))?;
 

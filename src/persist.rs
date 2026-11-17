@@ -185,7 +185,9 @@ pub fn remove_startup() -> Result<Option<Logon>, String> {
         return Ok(None);
     };
     // S4U holders are not tied to the interactive session, so deleting the task
-    // alone would leave the request raised until reboot.
+    // alone would leave the request raised until reboot. `/End` fails when the
+    // task is not running, which is normal and must not block `/Delete`; the
+    // caller's tick check is the real signal for a surviving holder.
     let _ = schtasks().args(["/End", "/TN", TASK_NAME]).output();
     let out = schtasks()
         .args(["/Delete", "/TN", TASK_NAME, "/F"])

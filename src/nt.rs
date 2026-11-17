@@ -60,10 +60,33 @@ unsafe extern "system" {
     fn SetThreadPriority(thread: Handle, priority: i32) -> i32;
     fn GetThreadPriority(thread: Handle) -> i32;
     fn SetProcessInformation(process: Handle, class: u32, info: *mut c_void, size: u32) -> i32;
-    fn CreateMutexW(security: *mut c_void, owner: i32, name: *const u16) -> Handle;
-    fn GetLastError() -> u32;
-    fn SetLastError(code: u32);
     fn CloseHandle(handle: Handle) -> i32;
+    fn GetLastError() -> u32;
+    fn LockFileEx(
+        file: Handle,
+        flags: u32,
+        reserved: u32,
+        nbytes_low: u32,
+        nbytes_high: u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+    fn UnlockFileEx(
+        file: Handle,
+        reserved: u32,
+        nbytes_low: u32,
+        nbytes_high: u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
+}
+
+/// `OVERLAPPED` for the synchronous `LockFileEx` call.
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: Handle,
 }
 
 #[link(name = "advapi32")]
@@ -221,38 +244,60 @@ pub fn prepare_sampling() {
     set_thread_priority(TIME_CRITICAL);
 }
 
-/// Held for as long as the process runs; the name is released on drop.
+/// Held for as long as the process runs; the byte-range lock is released on drop.
 pub struct InstanceGuard(Handle);
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         unsafe {
+            let mut ov = core::mem::zeroed::<Overlapped>();
+            UnlockFileEx(self.0, 0, 1, 0, &mut ov);
             CloseHandle(self.0);
         }
     }
 }
 
-const ERROR_ALREADY_EXISTS: u32 = 183;
+const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+const ERROR_LOCK_VIOLATION: u32 = 33;
+const ERROR_IO_PENDING: u32 = 997;
 
-/// Claim the measurement name for this process. Two runs share one tick, so
-/// each would measure the other's request instead of its own.
+/// Claim a cross-session measurement lock via an exclusive byte-range lock on a
+/// file in %TEMP%. Sessions of the same user share the temp dir, and the OS
+/// releases the lock on process exit, so a stale lock cannot survive a crash.
 pub fn bench_instance() -> Result<InstanceGuard, String> {
-    let name = wide("Local\\ticktune-bench");
-    // `CreateMutexW` reports "already exists" through the last error, which is
-    // only meaningful if nothing earlier in the process left a stale value.
-    unsafe { SetLastError(0) };
-    let handle = unsafe { CreateMutexW(core::ptr::null_mut(), 0, name.as_ptr()) };
-    if handle.is_null() {
-        return Err("CreateMutexW failed".to_string());
-    }
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        unsafe {
-            CloseHandle(handle);
+    use std::os::windows::io::IntoRawHandle;
+
+    let path = std::env::temp_dir().join("ticktune-bench.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let handle = file.into_raw_handle();
+    let mut ov: Overlapped = unsafe { core::mem::zeroed() };
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut ov,
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        unsafe { CloseHandle(handle) };
+        if err == ERROR_LOCK_VIOLATION || err == ERROR_IO_PENDING {
+            return Err(
+                "another ticktune measurement (bench or verify-global) is already running; wait for it to finish"
+                    .to_string(),
+            );
         }
-        return Err(
-            "another ticktune measurement (bench or verify-global) is already running; wait for it to finish"
-                .to_string(),
-        );
+        return Err(format!("LockFileEx failed: {err}"));
     }
     Ok(InstanceGuard(handle))
 }
