@@ -95,10 +95,10 @@ fn scan(opts: &Options, range: Range) -> Result<Report, String> {
     let mut partial = false;
 
     // Drain a press that happened before the scan started.
-    let _ = measure::escape_pressed();
+    let _ = measure::console_escape_pressed();
 
     for period in list {
-        if measure::escape_pressed() {
+        if measure::console_escape_pressed() {
             partial = true;
             break;
         }

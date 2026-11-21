@@ -28,7 +28,7 @@ usage: ticktune <command> [options]
 commands:
   query                     show the timer range, mode, and current state
   bench                     measure the timer curve and recommend a period
-  apply                     hold one timer request until ESC (in any window) or Ctrl+C
+  apply                     hold one timer request until ESC (from this console) or Ctrl+C
                             (with --persist it installs the holder and returns)
   status                    sample this process, then print the query block
   measure                   print p50/p95/interference for this process
@@ -568,18 +568,25 @@ notes:
             outln!("holding request; close this process to release.");
         }
         // With a console, Ctrl+C terminates the process and the kernel drops the
-        // request with it. --no-console keeps the holder windowless, which also
-        // removes Ctrl+C, so ESC is polled. --no-esc is for the logon holder:
-        // GetAsyncKeyState is desktop-global, so any ESC would end it.
+        // request with it. ESC comes from this console's input buffer, so only a
+        // press in the focused ticktune console releases the request - a press
+        // in another window (a game in front of it) does nothing. --no-console
+        // keeps the holder windowless, which also removes Ctrl+C; it has no
+        // console to focus, so there the desktop-wide key state is polled.
+        let escape: fn() -> bool = if no_console {
+            measure::escape_pressed
+        } else {
+            measure::console_escape_pressed
+        };
         if no_console {
             unsafe {
                 FreeConsole();
             }
         }
         if esc {
-            let _ = measure::escape_pressed(); // drop a press from before we started
+            let _ = escape(); // drop a press from before we started
             loop {
-                if measure::escape_pressed() {
+                if escape() {
                     outln!("released (ESC)");
                     return Ok(());
                 }
