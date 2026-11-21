@@ -136,7 +136,9 @@ Windows can report success and still ignore a request outside the honoured band.
 Keep the window open. The request belongs to this process alone, so `ticktune measure`
 in another terminal does not see it; to observe the effect system-wide, enable
 global mode (§2) and use `ticktune verify-global`. Press ESC or Ctrl+C (or close the
-window) to release it — no cleanup, no leftover state. With `--no-console` there is
+window) to release it — no cleanup, no leftover state. ESC is read desktop-wide:
+pressing it in any application (your game included) may end the holder, silently if
+this console is hidden behind it. With `--no-console` there is
 no Ctrl+C, so use ESC.
 
 ### 6. Keep it across reboots (optional, machine-wide only)

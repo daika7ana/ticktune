@@ -372,8 +372,11 @@ pub fn system32(tool: &str) -> String {
     }
 }
 
-/// Read `disabledynamictick` from BCD. `None` if it cannot be read (needs admin).
-pub fn dynamic_tick_disabled() -> Option<bool> {
+/// Read `disabledynamictick` from BCD. `None` if it cannot be read (needs
+/// admin) or the element is not set. `Err(value)` when the element is present
+/// but its value is not yes/no: localized builds translate the value column
+/// (the element name is locale-invariant), so report it raw instead of guessing.
+pub fn dynamic_tick_disabled() -> Option<Result<bool, String>> {
     use std::os::windows::process::CommandExt;
 
     let bcdedit = system32("bcdedit.exe");
@@ -392,9 +395,12 @@ pub fn dynamic_tick_disabled() -> Option<bool> {
             continue;
         }
         return match parts.next() {
-            Some(v) if v.eq_ignore_ascii_case("yes") => Some(true),
-            Some(v) if v.eq_ignore_ascii_case("no") => Some(false),
-            _ => None,
+            Some(v) if v.eq_ignore_ascii_case("yes") => Some(Ok(true)),
+            Some(v) if v.eq_ignore_ascii_case("no") => Some(Ok(false)),
+            // Present but unrecognized: guessing "disabled" from presence
+            // alone would flag a French "non" as a risk.
+            Some(v) => Some(Err(v.to_string())),
+            None => None,
         };
     }
     None

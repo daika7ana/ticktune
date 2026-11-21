@@ -28,7 +28,7 @@ usage: ticktune <command> [options]
 commands:
   query                     show the timer range, mode, and current state
   bench                     measure the timer curve and recommend a period
-  apply                     hold one timer request until ESC or Ctrl+C
+  apply                     hold one timer request until ESC (in any window) or Ctrl+C
                             (with --persist it installs the holder and returns)
   status                    sample this process, then print the query block
   measure                   print p50/p95/interference for this process
@@ -132,6 +132,12 @@ notes:
 
     fn dispatch() -> Result<(), Fail> {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        dispatch_from(&args)
+    }
+
+    /// Split from `dispatch` so the argument contract can be tested without
+    /// touching the real platform.
+    fn dispatch_from(args: &[String]) -> Result<(), Fail> {
         // `--help` works in any position, including after a subcommand.
         if args.iter().any(|a| a == "--help" || a == "-h") {
             outln!("{HELP}");
@@ -197,17 +203,24 @@ notes:
         );
         outln!("{:<20}{} ms", "global tick", fmt_period(range.current));
         let mode = match nt::global_requests_enabled() {
-            Some(1) => "global (GlobalTimerResolutionRequests=1)",
-            Some(0) => "per-process (GlobalTimerResolutionRequests=0)",
-            _ => "per-process",
+            Some(1) => "global (GlobalTimerResolutionRequests=1)".to_string(),
+            Some(0) => "per-process (GlobalTimerResolutionRequests=0)".to_string(),
+            // A value Windows does not produce (a typo or another tool): show it,
+            // because plain "per-process" would hide why requests stay local.
+            Some(v) => format!("per-process (GlobalTimerResolutionRequests={v})"),
+            None => "per-process".to_string(),
         };
         outln!("{:<20}{}", "mode", mode);
         match nt::dynamic_tick_disabled() {
-            Some(true) => {
+            Some(Ok(true)) => {
                 outln!("{:<20}disabled (! risk)", "dynamic tick");
                 outln!("{:<20}revert: bcdedit /deletevalue disabledynamictick", "");
             }
-            Some(false) => outln!("{:<20}enabled", "dynamic tick"),
+            Some(Ok(false)) => outln!("{:<20}enabled", "dynamic tick"),
+            Some(Err(value)) => outln!(
+                "{:<20}set, value '{value}' not recognized (localized bcdedit?); check `bcdedit /enum {{current}}`",
+                "dynamic tick"
+            ),
             // bcdedit omits the line when it was never set, which is the default.
             None if elevated => outln!("{:<20}unset (default: enabled)", "dynamic tick"),
             None => outln!("{:<20}unknown (run elevated to read)", "dynamic tick"),
@@ -679,7 +692,12 @@ notes:
             .ok_or_else(|| Fail::Op(format!("could not parse child output: {}", text.trim())))?;
 
         match stats::classify_global(baseline, child, coarsest) {
-            Verdict::Global => outln!("global: yes - a child process saw the finer tick"),
+            Verdict::Global => {
+                outln!("global: yes - a child process saw the finer tick");
+                // A background app that raised the tick mid-test is
+                // indistinguishable from our request, so the yes is not proof.
+                outln!("note: rerun on a quiet machine to confirm nothing else raised the tick.");
+            }
             Verdict::PerProcess => {
                 outln!(
                     "global: NO - requests are per-process on this machine (child p50={:.3}, baseline={:.3})",
@@ -748,6 +766,82 @@ notes:
             }
             Some("remove") => Err(Fail::Usage("startup remove takes no arguments".into())),
             _ => Err(Fail::Usage("expected: ticktune startup remove".into())),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Fail, dispatch_from, parse_samples};
+
+        /// The `Usage` message of a rejection, or `None` when the call did not
+        /// reject with a usage error.
+        fn usage(result: Result<(), Fail>) -> Option<String> {
+            match result {
+                Err(Fail::Usage(m)) => Some(m),
+                _ => None,
+            }
+        }
+
+        fn arg(v: &[&str]) -> Vec<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn help_works_in_any_position() {
+            assert!(dispatch_from(&arg(&["-h"])).is_ok());
+            assert!(dispatch_from(&arg(&["bench", "--help"])).is_ok());
+        }
+
+        /// Every case must reject before any Windows call runs, so these are
+        /// safe as unit tests.
+        #[test]
+        fn subcommand_routing_rejects_bad_usage() {
+            assert!(usage(dispatch_from(&arg(&[]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["nonsense"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["query", "extra"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["global"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["global", "maybe"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["startup"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["startup", "remove", "x"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["startup", "what"]))).is_some());
+        }
+
+        #[test]
+        fn apply_rejects_bad_periods_without_touching_the_platform() {
+            assert!(usage(dispatch_from(&arg(&["apply"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["apply", "--bogus"]))).is_some());
+            // Exactly one of --resolution / --ms.
+            assert!(
+                usage(dispatch_from(&arg(&[
+                    "apply",
+                    "--resolution",
+                    "5000",
+                    "--ms",
+                    "0.5"
+                ])))
+                .is_some()
+            );
+            assert!(usage(dispatch_from(&arg(&["apply", "--ms", "0"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["apply", "--ms", "nan"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["apply", "--resolution", "0"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["apply", "--resolution", "x"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["apply", "--resolution"]))).is_some());
+        }
+
+        #[test]
+        fn measure_rejects_bad_sample_counts_early() {
+            assert!(usage(dispatch_from(&arg(&["measure", "--samples", "0"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["measure", "--samples", "x"]))).is_some());
+            assert!(usage(dispatch_from(&arg(&["measure", "--bogus"]))).is_some());
+        }
+
+        #[test]
+        fn sample_counts_are_capped_and_reject_zero() {
+            assert!(parse_samples("0").is_err());
+            assert!(parse_samples("-1").is_err());
+            assert!(parse_samples("x").is_err());
+            assert_eq!(parse_samples("1000"), Ok(1000));
+            assert_eq!(parse_samples("999999"), Ok(100_000));
         }
     }
 }
