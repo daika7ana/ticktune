@@ -840,8 +840,8 @@ notes:
             assert!(parse_samples("0").is_err());
             assert!(parse_samples("-1").is_err());
             assert!(parse_samples("x").is_err());
-            assert_eq!(parse_samples("1000"), Ok(1000));
-            assert_eq!(parse_samples("999999"), Ok(100_000));
+            assert_eq!(parse_samples("1000").ok(), Some(1000));
+            assert_eq!(parse_samples("999999").ok(), Some(100_000));
         }
     }
 }
